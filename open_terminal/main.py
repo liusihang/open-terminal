@@ -2,6 +2,7 @@ import asyncio
 from importlib.metadata import version as _pkg_version
 import fnmatch
 import json
+import shlex
 
 import aiofiles
 import aiofiles.os
@@ -212,6 +213,181 @@ class ReplaceRequest(BaseModel):
         ...,
         description="List of find-and-replace operations to apply sequentially.",
     )
+
+
+class OfficeCliRequest(BaseModel):
+    command: str = Field(..., description="OfficeCLI command to execute.")
+    file: Optional[str] = Field(None, description="Document file path.")
+    path: Optional[str] = Field(None, description="DOM path.")
+    parent: Optional[str] = Field(None, description="Parent DOM path for add.")
+    type: Optional[str] = Field(None, description="Element type for add/create.")
+    selector: Optional[str] = Field(None, description="Selector for query.")
+    props: Optional[list[str]] = Field(
+        None, description="Property updates as key=value pairs."
+    )
+    mode: Optional[str] = Field(None, description="View mode.")
+    depth: Optional[int] = Field(None, description="Depth for get.")
+    index: Optional[int] = Field(None, description="Insert index for add/move.")
+    to: Optional[str] = Field(None, description="Move target parent path.")
+    after: Optional[str] = Field(None, description="Insert after path.")
+    before: Optional[str] = Field(None, description="Insert before path.")
+    path2: Optional[str] = Field(None, description="Second path for swap.")
+    start: Optional[int] = Field(None, description="Start line for view/raw.")
+    end: Optional[int] = Field(None, description="End line for view/raw.")
+    max_lines: Optional[int] = Field(None, description="Max lines for view.")
+    commands: Optional[str] = Field(None, description="Batch commands JSON.")
+    force: Optional[bool | str] = Field(
+        None, description="Continue on errors for batch/set/add."
+    )
+    part: Optional[str] = Field(None, description="Part path for raw.")
+    format: Optional[str] = Field(
+        None, description="Format selector for help (docx/xlsx/pptx)."
+    )
+
+
+_OFFICECLI_COMMANDS_REQUIRING_FILE = {
+    "view",
+    "get",
+    "query",
+    "set",
+    "add",
+    "remove",
+    "move",
+    "swap",
+    "raw",
+    "validate",
+    "check",
+    "batch",
+    "create",
+    "new",
+}
+
+
+def _officecli_require(value: Optional[str], field: str, command: str) -> str:
+    if not value:
+        raise ValueError(f"Command '{command}' requires '{field}'")
+    return value
+
+
+def _officecli_truthy(value: Optional[bool | str]) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def build_officecli_args(request: OfficeCliRequest, fs: UserFS) -> list[str]:
+    command = request.command.strip().lower()
+    if not command:
+        raise ValueError("Missing command")
+
+    args: list[str] = ["officecli"]
+
+    if command == "help":
+        if request.format:
+            args.append(request.format.strip().lower())
+        args.append("--json")
+        return args
+
+    args.append(command)
+
+    if command in _OFFICECLI_COMMANDS_REQUIRING_FILE:
+        args.append(fs.resolve_path(_officecli_require(request.file, "file", command)))
+
+    if command == "view":
+        args.append(_officecli_require(request.mode, "mode", command))
+    elif command == "get":
+        if request.path:
+            args.append(request.path)
+    elif command == "query":
+        args.append(_officecli_require(request.selector, "selector", command))
+    elif command == "set":
+        args.append(_officecli_require(request.path, "path", command))
+    elif command == "add":
+        args.append(_officecli_require(request.parent, "parent", command))
+    elif command == "remove":
+        args.append(_officecli_require(request.path, "path", command))
+    elif command == "move":
+        args.append(_officecli_require(request.path, "path", command))
+    elif command == "swap":
+        args.append(_officecli_require(request.path, "path", command))
+        args.append(_officecli_require(request.path2, "path2", command))
+    elif command == "raw":
+        if request.part:
+            args.append(request.part)
+
+    if request.start is not None:
+        args.extend(["--start", str(request.start)])
+    if request.end is not None:
+        args.extend(["--end", str(request.end)])
+    if request.max_lines is not None:
+        args.extend(["--max-lines", str(request.max_lines)])
+    if request.depth is not None:
+        args.extend(["--depth", str(request.depth)])
+    if request.index is not None:
+        args.extend(["--index", str(request.index)])
+    if request.to:
+        args.extend(["--to", request.to])
+    if request.after:
+        args.extend(["--after", request.after])
+    if request.before:
+        args.extend(["--before", request.before])
+    if request.type:
+        args.extend(["--type", request.type])
+    if request.commands:
+        args.extend(["--commands", request.commands])
+    if request.props:
+        for prop in request.props:
+            args.extend(["--prop", prop])
+    if _officecli_truthy(request.force):
+        args.append("--force")
+
+    args.append("--json")
+    return args
+
+
+async def _run_command_args(
+    args: list[str],
+    cwd: Optional[str],
+    run_as_user: Optional[str],
+    timeout: Optional[float],
+) -> tuple[int, str]:
+    if run_as_user:
+        inner = shlex.join(args)
+        if cwd:
+            inner = f"cd {shlex.quote(cwd)} && {inner}"
+        proc = await asyncio.create_subprocess_exec(
+            "sudo",
+            "-u",
+            run_as_user,
+            "--",
+            "bash",
+            "-lc",
+            inner,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    else:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    try:
+        if timeout is None:
+            stdout, stderr = await proc.communicate()
+        else:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise HTTPException(status_code=504, detail="officecli command timed out")
+
+    output = (stdout + stderr).decode("utf-8", errors="replace")
+    return proc.returncode, output
 
 
 
@@ -878,6 +1054,66 @@ async def upload_file(
     except OSError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"path": path, "size": len(content)}
+
+
+@app.post(
+    "/officecli",
+    operation_id="run_officecli",
+    summary="Run OfficeCLI in this Open Terminal runtime",
+    description=(
+        "Runs officecli directly inside this Open Terminal environment so file paths "
+        "resolve against the same workspace visible to terminal commands."
+    ),
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        400: {"description": "Invalid command input or officecli execution failure."},
+        401: {"description": "Invalid or missing API key."},
+        504: {"description": "officecli command timed out."},
+    },
+)
+async def run_officecli(
+    http_request: Request,
+    request: OfficeCliRequest,
+    timeout: Optional[float] = Query(
+        300,
+        description="Seconds to wait for officecli completion before timeout.",
+        ge=0,
+        le=3600,
+    ),
+):
+    fs = get_filesystem(http_request)
+    cwd = fs.home
+
+    try:
+        args = build_officecli_args(request, fs)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        exit_code, output = await _run_command_args(
+            args=args,
+            cwd=cwd,
+            run_as_user=fs.username,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=400,
+            detail="officecli executable not found in open-terminal runtime",
+        )
+
+    text = output.strip()
+    if exit_code != 0:
+        detail = text or f"officecli exited with code {exit_code}"
+        raise HTTPException(status_code=400, detail=detail)
+
+    if not text:
+        return {"ok": True}
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"output": text}
 
 
 
@@ -1586,4 +1822,3 @@ if ENABLE_NOTEBOOKS:
     from open_terminal.utils.notebooks import create_notebooks_router
 
     app.include_router(create_notebooks_router(verify_api_key))
-
