@@ -31,6 +31,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 
+# OfficeCLI (pinned + checksum verified)
+ARG OFFICECLI_VERSION=v1.0.44
+ARG OFFICECLI_REPO=iOfficeAI/OfficeCLI
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) officecli_asset="officecli-linux-x64" ;; \
+      arm64) officecli_asset="officecli-linux-arm64" ;; \
+      *) echo "Unsupported architecture for OfficeCLI: $arch" >&2; exit 1 ;; \
+    esac; \
+    officecli_base_url="https://github.com/${OFFICECLI_REPO}/releases/download/${OFFICECLI_VERSION}"; \
+    curl -fsSL "${officecli_base_url}/${officecli_asset}" -o /usr/local/bin/officecli; \
+    curl -fsSL "${officecli_base_url}/SHA256SUMS" -o /tmp/officecli-SHA256SUMS; \
+    officecli_expected="$(grep " ${officecli_asset}\$" /tmp/officecli-SHA256SUMS | awk '{print $1}')"; \
+    officecli_actual="$(sha256sum /usr/local/bin/officecli | awk '{print $1}')"; \
+    test -n "${officecli_expected}"; \
+    test "${officecli_expected}" = "${officecli_actual}"; \
+    chmod 0755 /usr/local/bin/officecli; \
+    rm -f /tmp/officecli-SHA256SUMS; \
+    /usr/local/bin/officecli --version
+
 # Node.js (LTS)
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
