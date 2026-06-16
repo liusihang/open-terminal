@@ -3,6 +3,7 @@ import hmac
 from importlib.metadata import version as _pkg_version
 import fnmatch
 import json
+import subprocess
 
 import aiofiles
 import aiofiles.os
@@ -18,13 +19,19 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, HTTPException, Path as PathParam, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
+from open_terminal.utils.apply_patch import (
+    PatchParseError,
+    commit_staged_patch,
+    parse_apply_patch_text,
+    stage_apply_patch,
+)
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner
 from open_terminal.utils.fs import UserFS
 
@@ -44,7 +51,6 @@ try:
     import fcntl
     import pty
     import struct
-    import subprocess
     import termios
 
     _PTY_AVAILABLE = True
@@ -61,6 +67,62 @@ def get_system_info() -> str:
         f"on {socket.gethostname()}{user_part} with {shell}. "
         f"Python {sys.version.split()[0]} is available."
     )
+
+
+_CLI_CONTRACT_COMMANDS = (
+    "rg",
+    "git",
+    "jq",
+    "python3",
+    "node",
+    "curl",
+    "tar",
+    "zip",
+    "unzip",
+    "find",
+    "sed",
+    "awk",
+    "file",
+    "patch",
+    "diff",
+)
+
+
+def _probe_cli_version(command: str) -> dict:
+    executable = shutil.which(command)
+    if not executable:
+        return {"available": False, "path": None, "version": None}
+
+    version_args = [executable, "--version"]
+    if command == "node":
+        version_args = [executable, "--version"]
+
+    try:
+        completed = subprocess.run(
+            version_args,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        if command == "awk":
+            try:
+                completed = subprocess.run(
+                    [executable, "-W", "version"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+            except Exception:
+                return {"available": True, "path": executable, "version": None}
+        else:
+            return {"available": True, "path": executable, "version": None}
+
+    output = (completed.stdout or completed.stderr or "").strip()
+    first_line = output.splitlines()[0] if output else None
+    return {"available": True, "path": executable, "version": first_line}
 
 
 def get_system_prompt() -> str:
@@ -89,7 +151,13 @@ def get_system_prompt() -> str:
 
 
 _EXECUTE_DESCRIPTION = (
-    "Run a shell command in the background and return a command ID.\n\n"
+    "Run a shell command in the background and return a process_id. "
+    "Use this as the primary system tool for filesystem search, git, package, "
+    "build, test, and diagnostic commands. Relative paths resolve against the "
+    "session cwd, or the supplied cwd when provided. If wait is omitted or the "
+    "command is still running, poll get_process_status with the returned "
+    "process_id to read output and completion status. Use send_process_input "
+    "for interactive stdin and kill_process to terminate long-running commands.\n\n"
     + get_system_info()
 )
 if EXECUTE_DESCRIPTION:
@@ -191,6 +259,31 @@ class WriteRequest(BaseModel):
         ...,
         description="Text content to write to the file.",
     )
+    overwrite: bool = Field(
+        False,
+        description="Defaults to false. If false, writing to an existing path returns a 409 conflict instead of replacing it.",
+    )
+
+
+class ApplyPatchRequest(BaseModel):
+    patch: str = Field(
+        ...,
+        description=(
+            "Patch text using the OpenAI apply_patch format. Must start with "
+            "'*** Begin Patch', contain one or more hunks such as "
+            "'*** Add File:', '*** Update File:', or '*** Delete File:', and end "
+            "with '*** End Patch'."
+        ),
+        json_schema_extra={
+            "examples": [
+                "*** Begin Patch\n*** Update File: path/to/file.py\n@@\n-old line\n+new line\n*** End Patch"
+            ]
+        },
+    )
+    dry_run: bool = Field(
+        False,
+        description="If true, validate and report changes without writing to disk.",
+    )
 
 
 class ReplacementChunk(BaseModel):
@@ -245,6 +338,111 @@ class ReplaceRequest(BaseModel):
         ...,
         description="List of find-and-replace operations to apply sequentially.",
     )
+
+
+class CliVersionInfo(BaseModel):
+    available: bool = Field(..., description="Whether the executable was found on PATH.")
+    path: Optional[str] = Field(None, description="Resolved executable path, or null when unavailable.")
+    version: Optional[str] = Field(None, description="First line of version output, or null when unavailable.")
+
+
+class EnvironmentOSInfo(BaseModel):
+    system: str = Field(..., description="Operating system name, for example Linux, Darwin, or Windows.")
+    release: str = Field(..., description="Operating system release.")
+    version: str = Field(..., description="Operating system version string.")
+    machine: str = Field(..., description="Machine architecture.")
+    python: str = Field(..., description="Python runtime version used by Open Terminal.")
+
+
+class EnvironmentPermissionsInfo(BaseModel):
+    multi_user: bool = Field(..., description="Whether Open Terminal is running in multi-user isolation mode.")
+    run_as_user: Optional[str] = Field(None, description="Provisioned OS user used for commands and file operations, if any.")
+    api_key_required: bool = Field(..., description="Whether API key authentication is enabled.")
+    path_boundary: str = Field(..., description="Effective file access boundary, such as own_home_only or server_process.")
+
+
+class EnvironmentResponse(BaseModel):
+    os: EnvironmentOSInfo = Field(..., description="Operating system and Python runtime metadata.")
+    hostname: str = Field(..., description="Host name reported by the runtime.")
+    user: str = Field(..., description="Effective user for this request.")
+    home: str = Field(..., description="Default home directory for this request.")
+    cwd: str = Field(..., description="Current session working directory.")
+    shell: str = Field(..., description="Default shell path.")
+    environment: dict[str, str] = Field(..., description="Selected environment variables such as PATH.")
+    cli_versions: dict[str, CliVersionInfo] = Field(..., description="Availability and version probe for the stable CLI contract.")
+    permissions: EnvironmentPermissionsInfo = Field(..., description="Authentication and path-boundary metadata.")
+    info: Optional[str] = Field(None, description="Operator-provided environment info, if configured.")
+
+
+class ReadFileResponse(BaseModel):
+    path: str = Field(..., description="Resolved file path that was read.")
+    total_lines: int = Field(..., description="Total number of lines in the text or extracted document.")
+    content: str = Field(..., description="Returned text content for the requested line range.")
+
+
+class DisplayFileResponse(BaseModel):
+    path: str = Field(..., description="Resolved path that the client should display to the user.")
+    exists: bool = Field(..., description="Whether the resolved path currently exists as a file.")
+
+
+class WriteFileResponse(BaseModel):
+    path: str = Field(..., description="Resolved file path that was written.")
+    size: int = Field(..., description="Number of UTF-8 bytes written.")
+
+
+class PatchConflictInfo(BaseModel):
+    path: str = Field(..., description="Resolved path where the conflict occurred.")
+    reason: str = Field(..., description="Reason the patch could not be applied.")
+
+
+class ErrorResponse(BaseModel):
+    detail: str = Field(..., description="Human-readable error detail.")
+
+
+class ApplyPatchConflictDetail(BaseModel):
+    message: str = Field(..., description="Conflict summary.")
+    conflicts: list[PatchConflictInfo] = Field(..., description="Patch conflicts that prevented applying any changes.")
+
+
+class ApplyPatchConflictResponse(BaseModel):
+    detail: ApplyPatchConflictDetail = Field(..., description="Structured patch conflict detail.")
+
+
+class PatchChangeInfo(BaseModel):
+    type: str = Field(..., description="Change type: add, update, delete, or move/update.")
+    path: str = Field(..., description="Resolved source path affected by the change.")
+    move_path: Optional[str] = Field(None, description="Resolved destination path for move hunks.")
+    size: Optional[int] = Field(None, description="UTF-8 byte size of the resulting file content, when applicable.")
+
+
+class ApplyPatchResponse(BaseModel):
+    applied: bool = Field(..., description="True when changes were written to disk; false for dry_run.")
+    dry_run: bool = Field(..., description="Whether this request validated without writing.")
+    changes: list[PatchChangeInfo] = Field(..., description="Staged or applied changes.")
+    conflicts: list[PatchConflictInfo] = Field(..., description="Conflicts; empty for successful 200 responses.")
+
+
+class ProcessSummaryResponse(BaseModel):
+    id: str = Field(..., description="process_id used with get_process_status, send_process_input, and kill_process.")
+    command: str = Field(..., description="Command string that was started.")
+    status: str = Field(..., description="Process status: running, done, or killed.")
+    exit_code: Optional[int] = Field(None, description="Process exit code when available.")
+    log_path: Optional[str] = Field(None, description="JSONL log path for persisted command output.")
+
+
+class ProcessOutputEntry(BaseModel):
+    type: str = Field(..., description="Output stream type: stdout, stderr, or output for PTY-combined output.")
+    data: str = Field(..., description="Output text chunk.")
+
+
+class ProcessStatusResponse(ProcessSummaryResponse):
+    output: list[ProcessOutputEntry] = Field(..., description="Output entries returned by this poll.")
+    truncated: bool = Field(..., description="Whether returned output was truncated by tail/log limits.")
+    next_offset: int = Field(..., description="Offset to pass to get_process_status to read only new output next time.")
+
+
+class StatusResponse(BaseModel):
+    status: str = Field(..., description="Operation status.")
 
 
 
@@ -378,6 +576,60 @@ async def get_config():
     }
 
 
+@app.get(
+    "/environment",
+    operation_id="get_environment",
+    summary="Get runtime environment",
+    description=(
+        "Return stable runtime metadata: OS, hostname, user, home, cwd, shell, "
+        "PATH, key CLI versions, and permission boundaries. Returns JSON fields: "
+        "os, hostname, user, home, cwd, shell, environment, cli_versions, "
+        "permissions, and info."
+    ),
+    response_model=EnvironmentResponse,
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        401: {"description": "Invalid or missing API key."},
+    },
+)
+async def get_environment(
+    http_request: Request,
+    fs: UserFS = Depends(get_filesystem),
+):
+    session_id = http_request.headers.get("x-session-id")
+    cwd = _get_session_cwd(session_id, fs) if session_id else fs.home
+    user = fs.username or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+
+    return {
+        "os": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "python": sys.version.split()[0],
+        },
+        "hostname": socket.gethostname(),
+        "user": user,
+        "home": fs.home,
+        "cwd": cwd,
+        "shell": os.environ.get("SHELL", "/bin/sh"),
+        "environment": {
+            "PATH": os.environ.get("PATH", ""),
+        },
+        "cli_versions": {
+            command: _probe_cli_version(command)
+            for command in _CLI_CONTRACT_COMMANDS
+        },
+        "permissions": {
+            "multi_user": MULTI_USER,
+            "run_as_user": fs.username,
+            "api_key_required": bool(API_KEY),
+            "path_boundary": "own_home_only" if fs.username else "server_process",
+        },
+        "info": OPEN_TERMINAL_INFO or None,
+    }
+
+
 if ENABLE_SYSTEM_PROMPT:
 
     @app.get(
@@ -394,6 +646,7 @@ if OPEN_TERMINAL_INFO:
 
     @app.get(
         "/info",
+        include_in_schema=False,
         operation_id="get_info",
         summary="Get environment info",
         description="Return operator-provided information about this environment. Use this to understand the system you are working with.",
@@ -441,6 +694,7 @@ async def set_cwd(
 
 @app.get(
     "/files/list",
+    include_in_schema=False,
     operation_id="list_files",
     summary="List directory contents",
     description="Return a structured listing of files and directories at the given path.",
@@ -468,9 +722,24 @@ async def list_files(
     "/files/read",
     operation_id="read_file",
     summary="Read a file",
-    description="Read a file and return its contents. Supports text files and images (PNG, JPEG, WebP, etc.). For text files you can optionally request a specific line range. Images are returned as binary so you can view and analyze them directly. Use display_file to show a file to the user.",
+    description=(
+        "Read a file and return its contents. Text files and extracted documents "
+        "return JSON with path, total_lines, and content. For text files you can "
+        "request a line range. Supported images return raw HTTP binary data with "
+        "the image MIME type, not base64. Use display_file to show a file to the user."
+    ),
+    response_model=ReadFileResponse,
     dependencies=[Depends(verify_api_key)],
     responses={
+        200: {
+            "description": "Returns JSON for text/document content. Raw binary image data is returned for supported image MIME types.",
+            "content": {
+                "image/png": {"schema": {"type": "string", "format": "binary"}},
+                "image/jpeg": {"schema": {"type": "string", "format": "binary"}},
+                "image/webp": {"schema": {"type": "string", "format": "binary"}},
+                "image/gif": {"schema": {"type": "string", "format": "binary"}},
+            },
+        },
         404: {"description": "File not found."},
         415: {"description": "Unsupported binary file type."},
         401: {"description": "Invalid or missing API key."},
@@ -543,7 +812,13 @@ async def read_file(
     "/files/display",
     operation_id="display_file",
     summary="Display a file to the user",
-    description="Open a file in the user's file viewer so they can see it. Use this when the user wants to view or look at a file. This does not return file content to you — use read_file if you need to read the content yourself.",
+    description=(
+        "Make a file visible to the user in the client preview/viewer. Use this "
+        "when the user wants to view or preview a file. This does not return file "
+        "content to you; use read_file if you need to read the content yourself. "
+        "Returns JSON with path and exists."
+    ),
+    response_model=DisplayFileResponse,
     dependencies=[Depends(verify_api_key)],
     responses={
         401: {"description": "Invalid or missing API key."},
@@ -608,9 +883,20 @@ async def serve_file(path: str, fs: UserFS = Depends(get_filesystem)):
     "/files/write",
     operation_id="write_file",
     summary="Write a file",
-    description="Write text content to a file. Creates parent directories automatically. Overwrites if the file already exists.",
+    description=(
+        "Write complete text content to a file. Parent directories are created "
+        "automatically. By default this tool does not overwrite existing files: "
+        "an existing path returns HTTP 409. Set overwrite=true only when replacing "
+        "the whole file is intended. Prefer apply_patch for localized edits. "
+        "Returns JSON with path and size."
+    ),
+    response_model=WriteFileResponse,
     dependencies=[Depends(verify_api_key)],
     responses={
+        409: {
+            "model": ErrorResponse,
+            "description": "File already exists and overwrite=false.",
+        },
         401: {"description": "Invalid or missing API key."},
     },
 )
@@ -618,6 +904,11 @@ async def write_file(http_request: Request, request: WriteRequest, fs: UserFS = 
     session_id = http_request.headers.get("x-session-id")
     session_cwd = _get_session_cwd(session_id, fs) if session_id else None
     target = fs.resolve_path(request.path, cwd=session_cwd)
+    if not request.overwrite and await fs.exists(target):
+        raise HTTPException(
+            status_code=409,
+            detail="File already exists; set overwrite=true to replace it",
+        )
     try:
         await fs.write(target, request.content)
     except (OSError, subprocess.CalledProcessError) as e:
@@ -687,6 +978,7 @@ async def move_entry(request: MoveRequest, fs: UserFS = Depends(get_filesystem))
 
 @app.post(
     "/files/replace",
+    include_in_schema=False,
     operation_id="replace_file_content",
     summary="Replace content in a file",
     description="Find and replace exact strings in a file. Supports multiple replacements in one call with optional line range narrowing.",
@@ -745,8 +1037,81 @@ async def replace_file_content(http_request: Request, request: ReplaceRequest, f
     return {"path": target, "size": len(content.encode())}
 
 
+@app.post(
+    "/files/apply_patch",
+    operation_id="apply_patch",
+    summary="Apply a patch",
+    description=(
+        "Apply an OpenAI apply_patch-format patch. The patch must use markers like "
+        "'*** Begin Patch', '*** Add File:', '*** Update File:', '*** Delete File:', "
+        "'*** Move to:', and '*** End Patch'. Supports multi-hunk updates, add, "
+        "delete, move, dry_run=true validation without writing, and structured "
+        "409 conflict reports when old content does not match. Returns JSON with "
+        "applied, dry_run, changes, and conflicts."
+    ),
+    response_model=ApplyPatchResponse,
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        400: {"description": "Patch syntax is invalid."},
+        409: {
+            "model": ApplyPatchConflictResponse,
+            "description": "Patch could not be applied cleanly.",
+        },
+        401: {"description": "Invalid or missing API key."},
+    },
+)
+async def apply_patch(
+    http_request: Request,
+    request: ApplyPatchRequest,
+    fs: UserFS = Depends(get_filesystem),
+):
+    session_id = http_request.headers.get("x-session-id")
+    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+
+    try:
+        changes = parse_apply_patch_text(request.patch)
+    except PatchParseError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    staged, conflicts = await stage_apply_patch(changes, fs, session_cwd)
+    if conflicts:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Patch could not be applied",
+                "conflicts": conflicts,
+            },
+        )
+
+    if not request.dry_run:
+        try:
+            await commit_staged_patch(staged, fs)
+        except (OSError, subprocess.CalledProcessError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "applied": not request.dry_run,
+        "dry_run": request.dry_run,
+        "changes": [
+            {
+                "type": change.type,
+                "path": change.path,
+                "move_path": change.move_path,
+                "size": (
+                    len((change.new_content or "").encode())
+                    if change.new_content is not None
+                    else None
+                ),
+            }
+            for change in staged
+        ],
+        "conflicts": [],
+    }
+
+
 @app.get(
     "/files/grep",
+    include_in_schema=False,
     operation_id="grep_search",
     summary="Search file contents",
     description="Search for a text pattern across files in a directory. Returns structured matches with file paths, line numbers, and matching lines. Skips binary files.",
@@ -861,6 +1226,7 @@ async def grep_search(
 
 @app.get(
     "/files/glob",
+    include_in_schema=False,
     operation_id="glob_search",
     summary="Search files by name",
     description="Search for files and subdirectories by name within a specified directory using glob patterns. Results will include the relative path, type, size, and modification time.",
@@ -1075,7 +1441,11 @@ async def archive_paths(
     "/execute",
     operation_id="list_processes",
     summary="List running commands",
-    description="Returns a list of all tracked background processes, including running, done, and killed.",
+    description=(
+        "Returns a JSON list of all tracked background processes, including "
+        "id, command, status, exit_code, and log_path."
+    ),
+    response_model=list[ProcessSummaryResponse],
     dependencies=[Depends(verify_api_key)],
     responses={
         401: {"description": "Invalid or missing API key."},
@@ -1100,6 +1470,7 @@ async def list_processes():
     operation_id="run_command",
     summary="Execute a command",
     description=_EXECUTE_DESCRIPTION,
+    response_model=ProcessStatusResponse,
     dependencies=[Depends(verify_api_key)],
     responses={
         401: {"description": "Invalid or missing API key."},
@@ -1168,7 +1539,12 @@ async def execute(
     "/execute/{process_id}/status",
     operation_id="get_process_status",
     summary="Get command status and output",
-    description="Returns new output since the last poll, process status, and exit code. Output is drained on read to keep memory bounded.",
+    description=(
+        "Poll a process started by run_command. Returns output, status, exit_code, "
+        "next_offset, truncation state, and log_path. Use offset=next_offset from "
+        "the previous response to read only new output."
+    ),
+    response_model=ProcessStatusResponse,
     dependencies=[Depends(verify_api_key)],
     responses={
         404: {"description": "Process not found."},
@@ -1176,7 +1552,10 @@ async def execute(
     },
 )
 async def get_status(
-    process_id: str,
+    process_id: str = PathParam(
+        ...,
+        description="The process_id returned by run_command.",
+    ),
     wait: Optional[float] = Query(
         None,
         description="Seconds to wait for the process to finish before returning. Returns early if the process exits. Null to return immediately.",
@@ -1226,7 +1605,12 @@ async def get_status(
     "/execute/{process_id}/input",
     operation_id="send_process_input",
     summary="Send input to a running command",
-    description="Write text to the process's stdin. Include newline characters as needed.",
+    description=(
+        "Write text to stdin for a running process started by run_command. Include "
+        "newlines when the command expects Enter. Literal escape sequences such as "
+        "\\n, \\x03, and \\x04 are converted before sending."
+    ),
+    response_model=StatusResponse,
     dependencies=[Depends(verify_api_key)],
     responses={
         404: {"description": "Process not found."},
@@ -1234,7 +1618,13 @@ async def get_status(
         401: {"description": "Invalid or missing API key."},
     },
 )
-async def send_input(process_id: str, body: InputRequest):
+async def send_input(
+    body: InputRequest,
+    process_id: str = PathParam(
+        ...,
+        description="The process_id returned by run_command.",
+    ),
+):
     background_process = _get_process(process_id)
     if background_process.status != "running":
         raise HTTPException(status_code=400, detail="Process has already exited")
@@ -1257,7 +1647,12 @@ async def send_input(process_id: str, body: InputRequest):
     "/execute/{process_id}",
     operation_id="kill_process",
     summary="Kill a running command",
-    description="Terminate the process. Sends SIGTERM by default for graceful shutdown. Use force=true to send SIGKILL.",
+    description=(
+        "Terminate the process. Sends SIGTERM by default for graceful shutdown "
+        "on Unix-like backends; use force=true to request SIGKILL or the closest "
+        "available forceful termination behavior."
+    ),
+    response_model=StatusResponse,
     dependencies=[Depends(verify_api_key)],
     responses={
         404: {"description": "Process not found."},
@@ -1265,7 +1660,10 @@ async def send_input(process_id: str, body: InputRequest):
     },
 )
 async def kill_process(
-    process_id: str,
+    process_id: str = PathParam(
+        ...,
+        description="The process_id returned by run_command.",
+    ),
     force: bool = Query(False, description="Send SIGKILL instead of SIGTERM."),
 ):
     background_process = _get_process(process_id)
@@ -1783,4 +2181,3 @@ if ENABLE_NOTEBOOKS:
     from open_terminal.utils.notebooks import create_notebooks_router
 
     app.include_router(create_notebooks_router(verify_api_key))
-
