@@ -36,6 +36,10 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# OfficeCLI for agent-friendly DOCX/XLSX/PPTX automation.
+RUN npm install -g @officecli/officecli@1.0.132 \
+    && officecli --version
+
 # Docker CLI + Compose + Buildx (mount socket at runtime for access)
 RUN curl -fsSL https://get.docker.com | sh
 
