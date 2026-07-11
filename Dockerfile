@@ -2,6 +2,14 @@
 # To pick up security patches, bump this version and rebuild.
 FROM python:3.12.13
 
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TIMEOUT=120
+
+RUN sed -i -E \
+    -e s#http://deb.debian.org/debian#https://mirrors.tuna.tsinghua.edu.cn/debian#g \
+    -e s#http://security.debian.org/debian-security#https://mirrors.tuna.tsinghua.edu.cn/debian-security#g \
+    /etc/apt/sources.list.d/debian.sources || true
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Core utilities
     coreutils findutils grep ripgrep sed gawk diffutils patch \
@@ -16,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Build tools
     build-essential cmake make \
     # Scripting & languages
-    perl ruby-full lua5.4 \
+    perl ruby-full lua5.4 r-base r-base-dev \
     # Data processing
     jq xmlstarlet sqlite3 \
     # Media & documents
@@ -30,6 +38,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Capabilities (needed for setcap on Python binary)
     libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
+
+# Use domestic package mirrors for Python and R at runtime too.
+RUN printf '[global]\nindex-url = https://pypi.tuna.tsinghua.edu.cn/simple\ntimeout = 120\n' > /etc/pip.conf \
+    && printf '%s\n' \
+        'local({' \
+        '  repos <- getOption("repos")' \
+        '  repos["CRAN"] <- "https://mirrors.tuna.tsinghua.edu.cn/CRAN/"' \
+        '  options(repos = repos)' \
+        '})' \
+        >> /etc/R/Rprofile.site
 
 # Node.js (LTS)
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
