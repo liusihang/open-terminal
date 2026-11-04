@@ -13,11 +13,125 @@ so that files belong to the provisioned user, not the server process.
 
 import asyncio
 import os
+import io
+import json
+import re
+import tempfile
 import shutil
 import subprocess
 
 import aiofiles
 import aiofiles.os
+from starlette.responses import FileResponse
+
+from open_terminal.utils.limits import CHUNK_SIZE, run_io
+
+
+class FullFileResponse(FileResponse):
+    """Stream the original full response without adding HTTP range/cache semantics."""
+
+    def set_stat_headers(self, stat_result):
+        self.headers.setdefault("content-length", str(stat_result.st_size))
+
+    async def __call__(self, scope, receive, send):
+        if "accept-ranges" in self.headers:
+            del self.headers["accept-ranges"]
+        scope = {**scope, "headers": [(key, value) for key, value in scope.get("headers", []) if key.lower() not in (b"range", b"if-range")]}
+        await super().__call__(scope, receive, send)
+
+
+class TemporaryFileResponse(FullFileResponse):
+    """Remove generated files even when sending the response is cancelled."""
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+
+
+_LINE_BREAK = re.compile(r"\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
+
+
+def line_range_offsets(text, start_line=None, end_line=None):
+    start_boundary = (start_line or 1) - 1
+    start = 0 if start_boundary == 0 else len(text)
+    end = len(text)
+    last_boundary = max(start_boundary, end_line or 0)
+    if last_boundary:
+        for number, match in enumerate(_LINE_BREAK.finditer(text), 1):
+            if number == start_boundary:
+                start = match.end()
+            if number == end_line:
+                end = match.end()
+            if number >= last_boundary:
+                break
+    return start, end
+
+
+def text_chunks(source):
+    """Yield splitlines-compatible line numbers and bounded pieces of text."""
+    number = 1
+    pending = ""
+    for chunk in iter(lambda: source.read(CHUNK_SIZE), ""):
+        chunk = pending + chunk
+        pending = "\r" if chunk.endswith("\r") else ""
+        if pending:
+            chunk = chunk[:-1]
+        start = 0
+        for match in _LINE_BREAK.finditer(chunk):
+            end = match.end()
+            yield number, chunk[start:end]
+            number += 1
+            start = end
+        if start < len(chunk):
+            yield number, chunk[start:]
+    if pending:
+        yield number, pending
+
+
+def read_text_range(path, start_line=None, end_line=None):
+    selected = io.StringIO()
+    total = 0
+    with open(path, encoding="utf-8") as source:
+        for total, chunk in text_chunks(source):
+            if total >= (start_line or 1) and (end_line is None or total <= end_line):
+                selected.write(chunk)
+    return {"total_lines": total, "content": selected.getvalue()}
+
+
+def _build_text_file_response(path, display_path, start_line=None, end_line=None, normalize_newlines=True):
+    """Build the original JSON response on disk, including arbitrarily long lines."""
+    fd, temporary = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as output, open(path, encoding="utf-8", newline=None if normalize_newlines else "") as source:
+            output.write('{"path":' + json.dumps(display_path) + ',"content":"')
+            total = 0
+            for total, chunk in text_chunks(source):
+                if total >= (start_line or 1) and (end_line is None or total <= end_line):
+                    output.write(json.dumps(chunk, ensure_ascii=False)[1:-1])
+            output.write('","total_lines":' + str(total) + '}')
+        return TemporaryFileResponse(temporary, media_type="application/json")
+    except BaseException:
+        os.unlink(temporary)
+        raise
+
+
+async def text_file_response(*args):
+    task = asyncio.create_task(asyncio.to_thread(_build_text_file_response, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            response = await task
+        except Exception:
+            pass
+        else:
+            os.unlink(response.path)
+        raise
 
 
 class UserFS:
@@ -179,10 +293,28 @@ class UserFS:
             "size": s.st_size,
             "modified": s.st_mtime,
             "type": "directory" if os.path.isdir(path) else "file",
+            "writable": self._is_writable_sync(path),
         }
 
+    def _is_writable_sync(self, path: str) -> bool:
+        if not self.is_path_allowed(path):
+            return False
+        try:
+            if os.statvfs(path).f_flag & getattr(os, "ST_RDONLY", 0):
+                return False
+        except (AttributeError, OSError):
+            pass
+        try:
+            return os.access(path, os.W_OK, effective_ids=True)
+        except (TypeError, OSError, NotImplementedError, AttributeError):
+            return os.access(path, os.W_OK)
+
+    async def is_writable(self, path: str) -> bool:
+        """Return whether the current process can write to *path*."""
+        return await asyncio.to_thread(self._is_writable_sync, path)
+
     async def listdir(self, path: str) -> list[dict]:
-        """List directory contents with type, size, and mtime."""
+        """List contents with type, size, modification/creation times, and writability."""
         self._check_path(path)
         def _list_sync():
             entries = []
@@ -197,11 +329,31 @@ class UserFS:
                         "type": "directory" if os.path.isdir(full) else "file",
                         "size": s.st_size,
                         "modified": s.st_mtime,
+                        "created": getattr(s, "st_birthtime", s.st_ctime if os.name == "nt" else None),
+                        "writable": self._is_writable_sync(full),
                     })
                 except OSError:
                     continue
+            # Python's Unix stat lacks birth time on Linux; ask GNU stat in batches.
+            if entries and entries[0]["created"] is None:
+                for offset in range(0, len(entries), 256):
+                    batch = entries[offset:offset + 256]
+                    try:
+                        result = subprocess.run(
+                            ["stat", "-L", r"--printf=%n\0%.9W\0", "--", *[e["name"] for e in batch]],
+                            cwd=path, capture_output=True, timeout=10,
+                            env={**os.environ, "LC_ALL": "C"},
+                        )
+                        if result.returncode and not result.stdout:
+                            break
+                        fields = result.stdout.split(b"\0")
+                        created = dict(zip(fields[::2], fields[1::2]))
+                        for entry in batch:
+                            entry["created"] = float(created.get(os.fsencode(entry["name"]), b"0")) or None
+                    except (OSError, subprocess.TimeoutExpired, ValueError):
+                        break
             return entries
-        return await asyncio.to_thread(_list_sync)
+        return await run_io(_list_sync)
 
     async def walk(self, path: str) -> list[tuple[str, list[str], list[str]]]:
         """Walk directory tree. Returns list of (dirpath, dirnames, filenames).
@@ -225,7 +377,7 @@ class UserFS:
                 ]
                 result.append((dirpath, dirnames, filenames))
             return result
-        return await asyncio.to_thread(_walk_filtered)
+        return await run_io(_walk_filtered)
 
     # ------------------------------------------------------------------
     # Write operations (native Python + chown for correct ownership)

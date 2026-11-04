@@ -74,6 +74,7 @@ FROM python:3.12.13-alpine
 RUN apk add --no-cache \
         tini \
         su-exec \
+        coreutils \
         curl \
         git \
         jq \
@@ -132,6 +133,7 @@ RUN chmod +x /app/entrypoint-slim.sh
 # and simplify the entrypoint — but su-exec handles it cleanly either way.
 #
 ENV SHELL=/bin/bash
+ENV OPEN_TERMINAL_BROWSER_NO_SANDBOX=true
 
 EXPOSE 8000
 

@@ -8,56 +8,112 @@ All libraries used are permissively licensed (MIT / BSD).
 """
 
 import zipfile
+from functools import wraps
 
 
-def extract_pdf(file_path: str) -> str:
-    """Extract text from a PDF file."""
+def text_extractor(separator="\n"):
+    def decorate(function):
+        @wraps(function)
+        def extract(*args, **kwargs):
+            return separator.join(function(*args, **kwargs))
+
+        def write_to(path, output, **kwargs):
+            first = True
+            for part in function(path, **kwargs):
+                if not first:
+                    output.write(separator)
+                output.write(part)
+                first = False
+        extract.write_to = write_to
+        return extract
+    return decorate
+
+
+@text_extractor()
+def extract_pdf(file_path: str, strict: bool = False) -> str:
+    """Extract PDF pages without retaining every page's text."""
     from pypdf import PdfReader
 
     reader = PdfReader(file_path)
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    if strict and reader.is_encrypted:
+        raise ValueError("Encrypted PDF. Provide an unencrypted copy.")
+    missing = []
+    for index, page in enumerate(reader.pages, 1):
+        text = page.extract_text() or ""
+        if strict and not text.strip():
+            missing.append(str(index))
+        yield text
+    if missing:
+        raise ValueError(f"No extractable text on PDF pages {', '.join(missing)}. OCR is required before comparison.")
 
 
+@text_extractor()
 def extract_docx(file_path: str) -> str:
-    """Extract text from a Word (.docx) file."""
+    """Extract current paragraph/table text, including tracked insertions, without saving."""
     from docx import Document as DocxDocument
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    from docx.oxml.ns import qn
+    from lxml import etree
 
     doc = DocxDocument(file_path)
-    parts = []
-    for para in doc.paragraphs:
-        parts.append(para.text)
-    for table in doc.tables:
-        for row in table.rows:
-            parts.append("\t".join(cell.text for cell in row.cells))
-    return "\n".join(parts)
+    body = doc.element.body
+    # Ignore historical properties before finding revisions in the current text.
+    for node in list(body.iter()):
+        if isinstance(node.tag, str) and node.tag.startswith(qn("w:")) and node.tag.endswith("Change"):
+            node.getparent().remove(node)
+    for node in body.xpath(".//w:tr[w:trPr/w:del] | .//w:tc[w:tcPr/w:cellDel]"):
+        node.getparent().remove(node)
+    joined_paragraphs = body.xpath(".//w:p[w:pPr/w:rPr/w:del]")
+    etree.strip_elements(body, qn("w:del"), qn("w:moveFrom"), with_tail=False)
+    etree.strip_tags(body, qn("w:ins"), qn("w:moveTo"))
+    # A deleted paragraph mark joins its text to the following paragraph.
+    for paragraph in reversed(joined_paragraphs):
+        following = paragraph.getnext()
+        if following is not None and following.tag == qn("w:p"):
+            for child in list(following):
+                if child.tag != qn("w:pPr"):
+                    paragraph.append(child)
+            following.getparent().remove(following)
+
+    for child in doc.element.body:
+        if child.tag.endswith("}p"):
+            yield (Paragraph(child, doc).text)
+        elif child.tag.endswith("}tbl"):
+            for row in Table(child, doc).rows:
+                yield ("\t".join(cell.text for cell in row.cells))
 
 
+
+@text_extractor()
 def extract_xlsx(file_path: str) -> str:
-    """Extract text from an Excel (.xlsx) file."""
+    """Extract spreadsheet rows incrementally, including sparse cell ranges."""
     from openpyxl import load_workbook
 
-    wb = load_workbook(file_path, read_only=True, data_only=True)
-    parts = []
-    for sheet in wb.worksheets:
-        parts.append(f"--- {sheet.title} ---")
-        for row in sheet.iter_rows(values_only=True):
-            parts.append("\t".join(str(c) if c is not None else "" for c in row))
-    wb.close()
-    return "\n".join(parts)
+    workbook = load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        for sheet in workbook.worksheets:
+            yield f"--- {sheet.title} ---"
+            for row in sheet.iter_rows(values_only=True):
+                yield "\t".join(str(cell) if cell is not None else "" for cell in row)
+    finally:
+        workbook.close()
 
 
+@text_extractor()
 def extract_pptx(file_path: str) -> str:
     """Extract text from a PowerPoint (.pptx) file."""
     from pptx import Presentation
 
     prs = Presentation(file_path)
-    parts = []
+
     for i, slide in enumerate(prs.slides, 1):
-        parts.append(f"--- Slide {i} ---")
+        yield (f"--- Slide {i} ---")
         for shape in slide.shapes:
             if shape.has_text_frame:
-                parts.append(shape.text_frame.text)
-    return "\n".join(parts)
+                yield (shape.text_frame.text)
+
 
 
 def extract_rtf(file_path: str) -> str:
@@ -69,20 +125,21 @@ def extract_rtf(file_path: str) -> str:
     return rtf_to_text(raw.decode("utf-8", errors="replace"))
 
 
+@text_extractor()
 def extract_xls(file_path: str) -> str:
     """Extract text from a legacy Excel (.xls) file."""
     import xlrd
 
     wb = xlrd.open_workbook(file_path)
-    parts = []
+
     for sheet in wb.sheets():
-        parts.append(f"--- {sheet.name} ---")
+        yield (f"--- {sheet.name} ---")
         for row_idx in range(sheet.nrows):
-            parts.append("\t".join(
+            yield ("\t".join(
                 str(sheet.cell_value(row_idx, col_idx))
                 for col_idx in range(sheet.ncols)
             ))
-    return "\n".join(parts)
+
 
 
 def extract_odt(file_path: str) -> str:
@@ -99,6 +156,7 @@ def extract_odt(file_path: str) -> str:
     )
 
 
+@text_extractor()
 def extract_ods(file_path: str) -> str:
     """Extract text from an OpenDocument Spreadsheet (.ods) file."""
     from lxml import etree
@@ -108,10 +166,10 @@ def extract_ods(file_path: str) -> str:
             tree = etree.parse(f)
     ns_table = "urn:oasis:names:tc:opendocument:xmlns:table:1.0"
     ns_text = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
-    parts = []
+
     for table in tree.iter(f"{{{ns_table}}}table"):
         name = table.get(f"{{{ns_table}}}name", "Sheet")
-        parts.append(f"--- {name} ---")
+        yield (f"--- {name} ---")
         for row in table.iter(f"{{{ns_table}}}table-row"):
             cells = []
             for cell in row.iter(f"{{{ns_table}}}table-cell"):
@@ -120,10 +178,11 @@ def extract_ods(file_path: str) -> str:
                     for p in cell.iter(f"{{{ns_text}}}p")
                 )
                 cells.append(cell_text)
-            parts.append("\t".join(cells))
-    return "\n".join(parts)
+            yield ("\t".join(cells))
 
 
+
+@text_extractor()
 def extract_odp(file_path: str) -> str:
     """Extract text from an OpenDocument Presentation (.odp) file."""
     from lxml import etree
@@ -133,21 +192,22 @@ def extract_odp(file_path: str) -> str:
             tree = etree.parse(f)
     ns_draw = "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
     ns_text = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
-    parts = []
+
     for i, page in enumerate(tree.iter(f"{{{ns_draw}}}page"), 1):
-        parts.append(f"--- Slide {i} ---")
+        yield (f"--- Slide {i} ---")
         for p in page.iter(f"{{{ns_text}}}p"):
             text = "".join(p.itertext()).strip()
             if text:
-                parts.append(text)
-    return "\n".join(parts)
+                yield (text)
 
 
-def extract_epub(file_path: str) -> str:
+
+@text_extractor("\n\n")
+def extract_epub(file_path: str, strict: bool = False) -> str:
     """Extract text from an EPUB e-book."""
     from lxml import etree
 
-    parts = []
+
     with zipfile.ZipFile(file_path) as zf:
         # Parse the container to find the root file
         with zf.open("META-INF/container.xml") as cf:
@@ -180,8 +240,10 @@ def extract_epub(file_path: str) -> str:
                         body = html_tree.find(".//body")
                         if body is not None:
                             text = "".join(body.itertext())
-                            parts.append(text.strip())
+                            yield (text.strip())
                 except (KeyError, etree.XMLSyntaxError):
+                    if strict:
+                        raise ValueError(f"Could not extract EPUB chapter: {item_path}")
                     continue
         else:
             for name in zf.namelist():
@@ -192,12 +254,15 @@ def extract_epub(file_path: str) -> str:
                             body = html_tree.find(".//body")
                             if body is not None:
                                 text = "".join(body.itertext())
-                                parts.append(text.strip())
+                                yield (text.strip())
                     except etree.XMLSyntaxError:
+                        if strict:
+                            raise ValueError(f"Could not extract EPUB chapter: {name}")
                         continue
-    return "\n\n".join(parts)
 
 
+
+@text_extractor()
 def extract_eml(file_path: str) -> str:
     """Extract text from an email message (.eml)."""
     import email
@@ -205,12 +270,12 @@ def extract_eml(file_path: str) -> str:
 
     with open(file_path, "rb") as f:
         msg = email.message_from_binary_file(f, policy=policy.default)
-    parts = []
+
     for header in ("From", "To", "Cc", "Date", "Subject"):
         val = msg.get(header)
         if val:
-            parts.append(f"{header}: {val}")
-    parts.append("")  # blank line after headers
+            yield (f"{header}: {val}")
+    yield ("")  # blank line after headers
     body = msg.get_body(preferencelist=("plain", "html"))
     if body:
         content = body.get_content()
@@ -218,8 +283,8 @@ def extract_eml(file_path: str) -> str:
             from lxml import etree
             tree = etree.HTML(content)
             content = "".join(tree.itertext()) if tree is not None else content
-        parts.append(content)
-    return "\n".join(parts)
+        yield (content)
+
 
 
 # MIME type / extension → extractor mapping.
@@ -238,3 +303,24 @@ EXTRACTORS: list[tuple[str | None, str | None, callable]] = [
     ("application/epub+zip", ".epub", extract_epub),
     ("message/rfc822", ".eml", extract_eml),
 ]
+
+
+if __name__ == "__main__":
+    import json
+    import mimetypes
+    import sys
+
+    try:
+        payload = json.load(sys.stdin)
+        path = payload["path"]
+        mime = mimetypes.guess_type(path)[0]
+        extractor = next(fn for kind, suffix, fn in EXTRACTORS if kind and kind == mime or suffix and path.lower().endswith(suffix))
+        with open(payload["output"], "w", encoding="utf-8", newline="") as output:
+            if hasattr(extractor, "write_to"):
+                extractor.write_to(path, output)
+            else:
+                output.write(extractor(path))
+        result = {}
+    except Exception as exc:
+        result = {"error": str(exc), "error_type": type(exc).__name__}
+    json.dump(result, sys.stdout)

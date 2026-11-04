@@ -1,9 +1,12 @@
 import asyncio
-import hmac
 from importlib.metadata import version as _pkg_version
 import fnmatch
+import heapq
 import json
-import subprocess
+import logging
+import tempfile
+from contextlib import asynccontextmanager
+import threading
 
 import aiofiles
 import aiofiles.os
@@ -13,30 +16,43 @@ import re
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import quote as url_quote
 
-from fastapi import Depends, FastAPI, File, HTTPException, Path as PathParam, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, HTTPException, Path as PathParam, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
+from open_terminal.browser.router import BrowserCORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.formparsers import MultiPartParser, MultiPartException, parse_options_header
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
-from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
+from open_terminal.dependencies import get_filesystem, matches_api_key, verify_api_key
+from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_BROWSER, ENABLE_DESKTOP, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
+from open_terminal.env import sanitized_environ
 from open_terminal.utils.apply_patch import (
-    PatchParseError,
-    commit_staged_patch,
-    parse_apply_patch_text,
-    stage_apply_patch,
+    PatchParseError, commit_staged_patch, parse_apply_patch_text, stage_apply_patch,
 )
-from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner
-from open_terminal.utils.fs import UserFS
+from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner, read_pty, write_pty, PtyRunner
+from open_terminal.utils.fs import UserFS, FullFileResponse as FileResponse, TemporaryFileResponse, text_file_response, line_range_offsets
+from open_terminal.utils.limits import (CHUNK_SIZE, NormalizeNullQueryMiddleware, run_io, run_worker)
+from open_terminal.utils.file_compare import CompareRequest, run_comparison
+from open_terminal.utils.git import GitRepository
+from open_terminal.utils.events import system_events
+from open_terminal.utils.search import search_entries, matching_files, ranked_page
+from open_terminal.utils.skills import join_skill_path, list_skill_resources, parse_skill_frontmatter
+
+MATCH_PAGE_SIZE = 100
+MAX_CONTENT_MATCHES_PER_FILE = 3
+MAX_CONTENT_SEARCH_FILE_SIZE = 1 * 1024 * 1024
+log = logging.getLogger(__name__)
 
 if MULTI_USER:
-    from open_terminal.utils.user_isolation import check_environment, resolve_user
+    from open_terminal.utils.user_isolation import check_environment
     check_environment()
 
 if not API_KEY:
@@ -125,10 +141,33 @@ def _probe_cli_version(command: str) -> dict:
     return {"available": True, "path": executable, "version": first_line}
 
 
+def _system_prompt_variables() -> dict[str, str]:
+    return {
+        "os": platform.system(),
+        "kernel": platform.release(),
+        "arch": platform.machine(),
+        "hostname": socket.gethostname(),
+        "user": "" if MULTI_USER else os.getenv("USER", "unknown"),
+        "shell": os.environ.get("SHELL", "/bin/sh"),
+        "python_version": sys.version.split()[0],
+        "home": os.path.expanduser("~"),
+    }
+
+
+def _expand_system_prompt_template(template: str) -> str:
+    values = _system_prompt_variables()
+
+    def replace(match: re.Match) -> str:
+        key = match.group(1).strip()
+        return values.get(key, match.group(0))
+
+    return re.sub(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", replace, template)
+
+
 def get_system_prompt() -> str:
     """Build a default system prompt for LLM integration."""
     if SYSTEM_PROMPT:
-        return SYSTEM_PROMPT
+        return _expand_system_prompt_template(SYSTEM_PROMPT)
 
     shell = os.environ.get("SHELL", "/bin/sh")
     user_part = f" as user '{os.getenv('USER', 'unknown')}'" if not MULTI_USER else ""
@@ -141,7 +180,10 @@ def get_system_prompt() -> str:
         "and search the filesystem. "
         "Prefer verifying the current state before making changes. "
         "When running commands, check the output to confirm success. "
-        "If a command produces no output, that typically means it succeeded."
+        "If a command produces no output, that typically means it succeeded.\n\n"
+        "When delivering created or updated files to the user, call display_file for each deliverable "
+        "before your final response. Do not invent download links or use sandbox: URLs. "
+        "After displaying the files, briefly confirm completion without repeating links."
     )
 
     if OPEN_TERMINAL_INFO:
@@ -162,7 +204,7 @@ _EXECUTE_DESCRIPTION = (
     "resolve against the session cwd, or the supplied cwd when provided. Omit or "
     "set wait=null to use server default behavior; set wait=0 to return immediately.\n"
     "Returns: JSON with id/process_id, command, status, exit_code, output entries, "
-    "truncated, next_offset, and log_path. If the command is still running, poll "
+    "cwd, truncated, next_offset, and log_path. If the command is still running, poll "
     "get_process_status with the process_id and next_offset.\n"
     "Errors: 401 means authentication failed; 422 means request validation failed. "
     "Use send_process_input for interactive stdin and kill_process to terminate "
@@ -171,41 +213,89 @@ _EXECUTE_DESCRIPTION = (
 if EXECUTE_DESCRIPTION:
     _EXECUTE_DESCRIPTION += "\n\n" + EXECUTE_DESCRIPTION
 
-bearer_scheme = HTTPBearer(auto_error=False)
+def get_file_browser_root(fs: UserFS) -> dict[str, str] | None:
+    configured = FILE_BROWSER_ROOT.strip()
+    mode = configured.lower()
+    if mode in ("", "home"):
+        return {"path": fs.home, "label": "Home"}
+    if mode == "filesystem":
+        return None
+
+    path = configured.replace("{{home}}", fs.home)
+    if path == "~":
+        path = fs.home
+    elif path.startswith("~/"):
+        path = os.path.join(fs.home, path[2:])
+
+    root_path = fs.resolve_path(path)
+    label = "Home" if root_path == fs.home else os.path.basename(root_path) or root_path
+    return {"path": root_path, "label": label}
 
 
-async def verify_api_key(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
-):
-    if not API_KEY:
-        return
-    if not credentials or not hmac.compare_digest(credentials.credentials, API_KEY):
-        raise HTTPException(status_code=401, detail="Invalid API key")
+async def _preview_pdf(target: str) -> str | None:
+    libreoffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not libreoffice:
+        return None
+    with tempfile.TemporaryDirectory() as tmpdir:
+        await run_worker([
+            libreoffice, "--headless", "--nologo", "--nofirststartwizard",
+            "--nodefault", "--nolockcheck", "--convert-to", "pdf", "--outdir", tmpdir, target,
+        ])
+        pdf = os.path.join(tmpdir, os.path.splitext(os.path.basename(target))[0] + ".pdf")
+        if not os.path.isfile(pdf):
+            matches = sorted(name for name in os.listdir(tmpdir) if name.lower().endswith(".pdf"))
+            if not matches:
+                return None
+            pdf = os.path.join(tmpdir, matches[0])
+        fd, result = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        try:
+            await run_io(shutil.copyfile, pdf, result)
+            return result
+        except BaseException:
+            os.unlink(result)
+            raise
 
 
-def get_filesystem(request: Request) -> UserFS:
-    """Build a :class:`UserFS` scoped to the requesting user.
-
-    When multi-user mode is active and the ``X-User-Id`` header is present,
-    returns a ``UserFS`` that routes all I/O through ``sudo -u``.
-    Otherwise returns a plain ``UserFS`` using stdlib.
-    """
-    if not MULTI_USER:
-        return UserFS()
-    user_id = request.headers.get("x-user-id")
-    if not user_id:
-        return UserFS()
-    username, home = resolve_user(user_id)
-    return UserFS(username=username, home=home)
+@asynccontextmanager
+async def lifespan(app):
+    maintenance = asyncio.create_task(_maintenance_loop())
+    try:
+        yield
+    finally:
+        maintenance.cancel()
+        await asyncio.gather(maintenance, return_exceptions=True)
+        for process in list(_processes.values()):
+            if process.finished_at is None:
+                process.runner.kill(force=True)
+        await asyncio.gather(*(p.log_task for p in _processes.values() if p.log_task), return_exceptions=True)
+        if ENABLE_TERMINAL:
+            for sid in list(_terminal_sessions):
+                await _cleanup_session(sid)
+        if ENABLE_NOTEBOOKS:
+            from open_terminal.utils.notebooks import shutdown_notebooks
+            await shutdown_notebooks()
+        if ENABLE_BROWSER:
+            from open_terminal.browser.router import shutdown as shutdown_browsers
+            await shutdown_browsers()
+        if ENABLE_DESKTOP:
+            from open_terminal.desktop import shutdown as shutdown_desktops
+            await shutdown_desktops()
+        global _port_proxy_client
+        if _port_proxy_client is not None:
+            await _port_proxy_client.aclose()
+            _port_proxy_client = None
 
 
 app = FastAPI(
+    lifespan=lifespan,
     title="Open Terminal",
-    description="A remote terminal API.",
+    description="A remote computer API.",
     version=_pkg_version("open-terminal"),
 )
+app.add_middleware(NormalizeNullQueryMiddleware)
 app.add_middleware(
-    CORSMiddleware,
+    BrowserCORSMiddleware,
     allow_origins=[o.strip() for o in CORS_ALLOWED_ORIGINS.split(",")],
     allow_credentials=True,
     allow_methods=["*"],
@@ -216,18 +306,6 @@ app.add_middleware(
 @app.exception_handler(PermissionError)
 async def permission_error_handler(request: Request, exc: PermissionError):
     return JSONResponse(status_code=403, content={"detail": str(exc)})
-
-
-@app.middleware("http")
-async def normalize_null_query_params(request: Request, call_next):
-    """Strip query parameters whose value is the literal string 'null'."""
-    from urllib.parse import urlencode
-
-    raw_params = request.query_params.multi_items()
-    cleaned = [(k, v) for k, v in raw_params if v.lower() != "null"]
-    if len(cleaned) != len(raw_params):
-        request.scope["query_string"] = urlencode(cleaned).encode("utf-8")
-    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +522,7 @@ class ProcessOutputEntry(BaseModel):
 
 
 class ProcessStatusResponse(ProcessSummaryResponse):
+    cwd: Optional[str] = Field(None, description="Working directory in which run_command started the command, when provided.")
     output: list[ProcessOutputEntry] = Field(..., description="Output entries returned by this poll.")
     truncated: bool = Field(..., description="Whether returned output was truncated by tail/log limits.")
     next_offset: int = Field(..., description="Offset to pass to get_process_status to read only new output next time.")
@@ -452,6 +531,19 @@ class ProcessStatusResponse(ProcessSummaryResponse):
 class StatusResponse(BaseModel):
     status: str = Field(..., description="Operation status.")
 
+
+class SkillSummary(BaseModel):
+    id: str
+    name: str
+    description: str
+    location: str
+    scope: str
+    source: str = "terminal"
+
+
+class SkillReadResponse(SkillSummary):
+    content: str
+    resources: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -467,21 +559,38 @@ class BackgroundProcess:
     status: str = "running"
     exit_code: Optional[int] = None
     log_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    input_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     finished_at: Optional[float] = field(default=None, repr=False)
     log_path: Optional[str] = field(default=None, repr=False)
+    user_id: str = ""
+    session_id: str = ""
+    changed: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+
+    def notify_output(self):
+        changed, self.changed = self.changed, asyncio.Event()
+        changed.set()
 
 
 _processes: dict[str, BackgroundProcess] = {}
+_process_list_changed = asyncio.Event()
+
+
+def _notify_process_list():
+    global _process_list_changed
+    changed, _process_list_changed = _process_list_changed, asyncio.Event()
+    changed.set()
+
+
 _EXPIRY_SECONDS = 300  # auto-clean finished processes after 5 min
 
 
 # ---------------------------------------------------------------------------
 # Per-session working directory tracking
 # ---------------------------------------------------------------------------
-# Maps session_id → (absolute_cwd_path, last_accessed_timestamp).
+# Maps (user home, session_id) → (absolute_cwd_path, last_accessed_timestamp).
 # Replaces the old os.chdir() approach which was process-global and unsafe
 # with concurrent sessions.
-_session_cwds: dict[str, tuple[str, float]] = {}
+_session_cwds: dict[tuple[str, str], tuple[str, float]] = {}
 
 
 
@@ -496,54 +605,74 @@ def _expire_session_cwds():
 def _get_session_cwd(session_id: str | None, fs: "UserFS") -> str:
     """Return the tracked cwd for *session_id*, or ``fs.home`` as default."""
     _expire_session_cwds()
-    if session_id and session_id in _session_cwds:
-        cwd, _ = _session_cwds[session_id]
-        _session_cwds[session_id] = (cwd, time.time())  # refresh TTL
+    key = (fs.home, session_id)
+    if session_id and key in _session_cwds:
+        cwd, _ = _session_cwds[key]
+        _session_cwds[key] = (cwd, time.time())  # refresh TTL
         return cwd
     return fs.home
 
 
-def _set_session_cwd(session_id: str | None, path: str):
+def _set_session_cwd(session_id: str | None, path: str, fs: "UserFS"):
     """Store a session's cwd.  No-op if *session_id* is ``None``."""
     if session_id:
-        _session_cwds[session_id] = (path, time.time())
+        _expire_session_cwds()
+        _session_cwds[(fs.home, session_id)] = (path, time.time())
 
 
-from open_terminal.utils.log import log_process, read_log
+from open_terminal.utils.log import LogReader, log_process, log_response
 
 
 
 
 def _cleanup_expired():
-    """Remove finished processes that have expired.
-
-    Also deletes log files older than *LOG_RETENTION_SECONDS*.
-    """
     now = time.time()
-    expired = [
-        process_id
-        for process_id, background_process in _processes.items()
-        if background_process.finished_at
-        and now - background_process.finished_at > _EXPIRY_SECONDS
-    ]
-    for process_id in expired:
-        bp = _processes.pop(process_id)
-        # Delete the log file if it has exceeded the retention period.
-        if (
-            bp.log_path
-            and bp.finished_at
-            and now - bp.finished_at > PROCESS_LOG_RETENTION
-        ):
-            try:
-                os.remove(bp.log_path)
-            except OSError:
-                pass
+    finished = [p for p in _processes.values() if p.finished_at is not None]
+    for process in finished:
+        if now - process.finished_at > _EXPIRY_SECONDS:
+            _processes.pop(process.id, None)
+            _notify_process_list()
 
 
-def _get_process(process_id: str) -> BackgroundProcess:
+def _cleanup_log_files(active_paths):
+    directory = os.path.join(LOG_DIR, "processes")
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.path in active_paths or not entry.name.endswith((".jsonl", ".rotating")):
+                    continue
+                try:
+                    if entry.is_file(follow_symlinks=False) and time.time() - entry.stat().st_mtime > PROCESS_LOG_RETENTION:
+                        os.unlink(entry.path)
+                except OSError:
+                    pass
+    except FileNotFoundError:
+        pass
+
+
+async def _maintenance_loop():
+    while True:
+        _cleanup_expired()
+        _expire_session_cwds()
+        if ENABLE_TERMINAL:
+            for sid, session in list(_terminal_sessions.items()):
+                if not _session_is_alive(session):
+                    await _cleanup_session(sid)
+        active = {p.log_path for p in _processes.values() if p.finished_at is None}
+        try:
+            await run_io(_cleanup_log_files, active)
+        except OSError as exc:
+            log.warning("Log retention cleanup failed: %s", exc)
+        await asyncio.sleep(60)
+
+
+def _get_process(process_id: str, request: Request) -> BackgroundProcess:
     _cleanup_expired()
     background_process = _processes.get(process_id)
-    if not background_process:
+    if not background_process or (
+        background_process.user_id != request.headers.get("x-user-id", "")
+        or background_process.session_id != request.headers.get("x-session-id", "")
+    ):
         raise HTTPException(status_code=404, detail="Process not found")
     return background_process
 
@@ -580,6 +709,10 @@ async def get_config():
             "terminal": ENABLE_TERMINAL,
             "notebooks": ENABLE_NOTEBOOKS,
             "system": ENABLE_SYSTEM_PROMPT,
+            "git": shutil.which("git") is not None,
+            "events": True,
+            "browser": ENABLE_BROWSER,
+            "desktop": ENABLE_DESKTOP and desktop_available(),
         },
     }
 
@@ -669,6 +802,41 @@ if OPEN_TERMINAL_INFO:
         return {"info": OPEN_TERMINAL_INFO}
 
 
+GLOBAL_SKILL_DIRS = (".agents/skills", ".cptr/skills", ".claude/skills", ".codex/skills")
+
+
+async def _list_skills_in_dir(fs: UserFS, root: str, scope: str) -> list[SkillSummary]:
+    if not await fs.isdir(root):
+        return []
+
+    skills: list[SkillSummary] = []
+    for entry in await fs.listdir(root):
+        dirname = str(entry.get("name") or "")
+        if entry.get("type") != "directory" or not dirname or dirname.startswith("."):
+            continue
+        skill_dir = join_skill_path(root, dirname)
+        skill_path = join_skill_path(skill_dir, "SKILL.md")
+        if not await fs.isfile(skill_path):
+            continue
+        frontmatter, _ = parse_skill_frontmatter(await fs.read_text(skill_path))
+        description = (frontmatter.get("description") or "").strip()
+        if not description:
+            continue
+        name = (frontmatter.get("name") or dirname).strip()
+        if not name:
+            continue
+        skills.append(
+            SkillSummary(
+                id=f"terminal:{url_quote(name, safe='')}",
+                name=name,
+                description=description[:1024],
+                location=skill_path,
+                scope=scope,
+            )
+        )
+    return skills
+
+
 # ---------------------------------------------------------------------------
 # Files
 # ---------------------------------------------------------------------------
@@ -684,7 +852,14 @@ async def get_cwd(
     fs: UserFS = Depends(get_filesystem),
 ):
     session_id = http_request.headers.get("x-session-id")
-    return {"cwd": _get_session_cwd(session_id, fs)}
+    response = {
+        "cwd": _get_session_cwd(session_id, fs),
+        "home": fs.home,
+    }
+    root = get_file_browser_root(fs)
+    if root:
+        response["root"] = root
+    return response
 
 
 @app.post(
@@ -699,10 +874,66 @@ async def set_cwd(
 ):
     session_id = http_request.headers.get("x-session-id")
     target = fs.resolve_path(request.path)
-    if not fs.username and not await fs.isdir(target):
+    if not await fs.isdir(target):
         raise HTTPException(status_code=404, detail="Directory not found")
-    _set_session_cwd(session_id, target)
+    _set_session_cwd(session_id, target, fs)
     return {"cwd": target}
+
+
+@app.get(
+    "/skills",
+    response_model=list[SkillSummary],
+    include_in_schema=False,
+    dependencies=[Depends(verify_api_key)],
+)
+async def list_skills(
+    http_request: Request,
+    fs: UserFS = Depends(get_filesystem),
+):
+    roots = [("global", join_skill_path(fs.home, path)) for path in GLOBAL_SKILL_DIRS]
+    seen_names: set[str] = set()
+    seen_roots: set[str] = set()
+    skills: list[SkillSummary] = []
+
+    for scope, root in roots:
+        root = os.path.normpath(root)
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+        for skill in await _list_skills_in_dir(fs, root, scope):
+            if skill.name in seen_names:
+                continue
+            seen_names.add(skill.name)
+            skills.append(skill)
+
+    return skills
+
+
+@app.get(
+    "/skills/read",
+    response_model=SkillReadResponse,
+    include_in_schema=False,
+    dependencies=[Depends(verify_api_key)],
+)
+async def read_skill(
+    http_request: Request,
+    name: str = Query(..., description="Skill name from /skills."),
+    fs: UserFS = Depends(get_filesystem),
+):
+    for skill in await list_skills(http_request, fs):
+        if skill.name != name:
+            continue
+
+        text = await fs.read_text(skill.location)
+        _frontmatter, body = parse_skill_frontmatter(text)
+        resources = await list_skill_resources(fs, os.path.dirname(skill.location))
+        return SkillReadResponse(
+            **skill.model_dump(),
+            resources=resources,
+            content=body,
+        )
+
+    raise HTTPException(status_code=404, detail="Skill not found")
 
 
 @app.get(
@@ -728,7 +959,156 @@ async def list_files(
     if not await fs.isdir(target):
         raise HTTPException(status_code=404, detail="Directory not found")
     entries = await fs.listdir(target)
-    return {"dir": target, "entries": entries}
+    return {"dir": target, "writable": await fs.is_writable(target), "entries": entries}
+
+
+@app.websocket("/events")
+async def ws_events(ws: WebSocket):
+    payload = await _authenticate_websocket(ws)
+    if payload is None:
+        return
+    request = Request({**ws.scope, "type": "http", "method": "GET"})
+    try:
+        fs = await asyncio.to_thread(get_filesystem, request)
+        session_id = ws.headers.get("x-session-id", payload.get("chat_id", ""))
+        async def ports():
+            previous = None
+            async for snapshot in watch_listening_ports():
+                visible = await _visible_ports(request, snapshot)
+                visible = [{k: v for k, v in port.items() if k != "uid"} for port in visible]
+                if visible != previous:
+                    yield visible
+                    previous = visible
+
+        await system_events(ws, fs, _get_session_cwd(session_id, fs), ports)
+    except HTTPException:
+        await ws.close(code=4003, reason="Filesystem access denied")
+
+
+async def _authenticate_websocket(ws: WebSocket):
+    await ws.accept()
+    try:
+        payload = await asyncio.wait_for(ws.receive_json(), timeout=10)
+        if not isinstance(payload, dict) or payload.get("type") != "auth" or not matches_api_key(payload.get("token")):
+            await ws.close(code=4001, reason="Invalid API key")
+            return
+    except WebSocketDisconnect:
+        return
+    except (TimeoutError, ValueError, KeyError):
+        await ws.close(code=4001, reason="Auth timeout or invalid payload")
+        return
+    if not isinstance(ws.headers.get("x-session-id", payload.get("chat_id", "")), str):
+        await ws.close(code=4000, reason="Invalid session")
+        return
+    return payload
+
+
+@app.get("/git/status", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def git_status(http_request: Request, root: str = ".", fs: UserFS = Depends(get_filesystem)):
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
+    return await GitRepository(fs, root, cwd).status()
+
+
+@app.get("/git/diff", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def git_diff(http_request: Request, file: str, root: str = ".", staged: bool = False,
+                   untracked: bool = False, ignore_whitespace: bool = False, fs: UserFS = Depends(get_filesystem)):
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
+    return await GitRepository(fs, root, cwd).diff(file, staged, untracked, ignore_whitespace)
+
+
+@app.get("/git/log", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def git_history(http_request: Request, root: str = ".", limit: int = 50, offset: int = 0, fs: UserFS = Depends(get_filesystem)):
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
+    return await GitRepository(fs, root, cwd).history(limit, offset)
+
+
+@app.get("/git/show", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def git_show(http_request: Request, ref: str, root: str = ".", fs: UserFS = Depends(get_filesystem)):
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
+    return await GitRepository(fs, root, cwd).show(ref)
+
+
+@app.get("/git/branches", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def git_branches(http_request: Request, root: str = ".", fs: UserFS = Depends(get_filesystem)):
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
+    return await GitRepository(fs, root, cwd).branches()
+
+
+@app.get("/git/worktrees", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def git_worktrees(http_request: Request, root: str = ".", fs: UserFS = Depends(get_filesystem)):
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
+    return await GitRepository(fs, root, cwd).worktrees()
+
+
+@app.get("/git/pr/{view}", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def git_pull_requests(http_request: Request, view: str, root: str = ".", number: int = 0,
+                            state: str = "open", fs: UserFS = Depends(get_filesystem)):
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
+    return await GitRepository(fs, root, cwd).pull_requests(view, number, state)
+
+
+class PullRequestAction(BaseModel):
+    root: str = "."
+    number: int = 0
+    title: str = ""
+    body: str = ""
+    base: str = ""
+    head: str = ""
+    draft: bool = False
+    strategy: str = "squash"
+    event: str = "comment"
+
+
+@app.post("/git/pr/{action}", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def git_pull_request_action(http_request: Request, action: str, payload: PullRequestAction, fs: UserFS = Depends(get_filesystem)):
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
+    fields = payload.model_dump(exclude={"root", "strategy", "event"})
+    if action == "review":
+        if payload.event not in ("approve", "comment", "request_changes"):
+            raise HTTPException(400, "Invalid review event")
+        action = {"approve": "approve", "comment": "review-comment", "request_changes": "request-changes"}[payload.event]
+    return await GitRepository(fs, payload.root, cwd).pull_request_action(action, method=payload.strategy, **fields)
+
+
+class GitActionRequest(BaseModel):
+    root: str = "."
+    files: list[str] = Field(default_factory=list)
+    message: str = ""
+    branch: str = ""
+    name: str = ""
+    path: str = ""
+    old_name: str = ""
+    new_name: str = ""
+    set_upstream: bool = False
+
+
+@app.api_route("/git/{action}", methods=["POST", "PATCH", "DELETE"], dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def git_action(http_request: Request, action: str, payload: GitActionRequest, fs: UserFS = Depends(get_filesystem)):
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
+    branch, target = payload.branch, ""
+    if action == "branch":
+        if http_request.method == "DELETE":
+            action, branch = "delete_branch", payload.name
+        elif http_request.method == "PATCH":
+            action, branch, target = "rename_branch", payload.old_name, payload.new_name
+        else:
+            branch = payload.name
+    elif http_request.method != "POST":
+        raise HTTPException(405, "Method not allowed")
+    elif action == "worktrees":
+        action, target = "worktree", payload.path
+    elif action == "push" and payload.set_upstream:
+        action = "publish"
+    if action not in {"stage", "unstage", "discard", "commit", "checkout", "branch", "delete_branch", "rename_branch", "worktree", "fetch", "pull", "push", "publish", "stash", "unstash", "uncommit"}:
+        raise HTTPException(404, "Unknown Git operation")
+    return await GitRepository(fs, payload.root, cwd).action(action, payload.files, payload.message, branch, target)
+
+
+@app.post("/files/compare", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def compare_files(http_request: Request, payload: CompareRequest, fs: UserFS = Depends(get_filesystem)):
+    session_id = http_request.headers.get("x-session-id")
+    cwd = _get_session_cwd(session_id, fs) if session_id else None
+    return await run_comparison(http_request, payload, fs, cwd)
 
 
 @app.get(
@@ -783,50 +1163,35 @@ async def read_file(
     if not await fs.isfile(target):
         raise HTTPException(status_code=404, detail="File not found")
 
+    fs._check_path(target)
     try:
-        content = await fs.read_text(target)
-        lines = content.splitlines(keepends=True)
-    except (UnicodeDecodeError, ValueError):
-        import mimetypes
+        return await text_file_response(target, target, start_line, end_line)
+    except UnicodeDecodeError:
+        pass
 
-        raw = await fs.read(target)
-        mime, _ = mimetypes.guess_type(target)
-        mime = mime or "application/octet-stream"
+    import mimetypes
+    from open_terminal.utils.documents import EXTRACTORS
 
-        # Try document text extraction (PDF, Office, OpenDocument, etc.)
-        from open_terminal.utils.documents import EXTRACTORS
-
-        for ext_mime, ext_suffix, extractor in EXTRACTORS:
-            if (ext_mime and mime == ext_mime) or (
-                ext_suffix and target.lower().endswith(ext_suffix)
-            ):
-                text = await asyncio.to_thread(extractor, target)
-                lines = text.splitlines(keepends=True)
-                start = (start_line or 1) - 1
-                end = end_line or len(lines)
-                return {
-                    "path": target,
-                    "total_lines": len(lines),
-                    "content": "".join(lines[start:end]),
-                }
-
-        # Return raw binary for allowed mime type prefixes (e.g. image/*)
-        if any(mime.startswith(prefix) for prefix in BINARY_FILE_MIME_PREFIXES):
-            return Response(content=raw, media_type=mime)
-
-        # Other binary files: reject (LLMs can't interpret raw bytes)
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported binary file type: {mime} ({len(raw)} bytes)",
-        )
-
-    start = (start_line or 1) - 1
-    end = end_line or len(lines)
-    return {
-        "path": target,
-        "total_lines": len(lines),
-        "content": "".join(lines[start:end]),
-    }
+    mime = mimetypes.guess_type(target)[0] or "application/octet-stream"
+    if any(kind and mime == kind or suffix and target.lower().endswith(suffix) for kind, suffix, _ in EXTRACTORS):
+        fd, extracted_path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        try:
+            result = json.loads(await run_worker(
+                [sys.executable, "-m", "open_terminal.utils.documents"],
+                json.dumps({"path": target, "output": extracted_path}).encode(),
+                request=http_request, timeout=None,
+            ))
+            if "error" in result:
+                if result.get("error_type") == "PermissionError":
+                    raise PermissionError(result["error"])
+                raise ValueError(result["error"])
+            return await text_file_response(extracted_path, target, start_line, end_line, False)
+        finally:
+            os.unlink(extracted_path)
+    if any(mime.startswith(prefix) for prefix in BINARY_FILE_MIME_PREFIXES):
+        return FileResponse(target, media_type=mime)
+    raise HTTPException(415, f"Unsupported binary file type: {mime} ({os.path.getsize(target)} bytes)")
 
 
 @app.get(
@@ -875,6 +1240,7 @@ async def display_file(
 )
 async def view_file(
     path: str = Query(..., description="Path to the file to view."),
+    preview: bool = Query(False, description="Return a best-effort rendered preview when available."),
     fs: UserFS = Depends(get_filesystem),
 ):
     """Return raw file bytes with the appropriate Content-Type.
@@ -886,12 +1252,25 @@ async def view_file(
     if not await fs.isfile(target):
         raise HTTPException(status_code=404, detail="File not found")
 
+    if preview:
+        ext = os.path.splitext(target)[1].lower()
+        if ext in (".docx", ".pptx"):
+            try:
+                fs._check_path(target)
+                pdf = await _preview_pdf(target)
+            except Exception:
+                log.exception("Rendered preview failed for %s", target)
+                pdf = None
+
+            if pdf:
+                return TemporaryFileResponse(pdf, media_type="application/pdf")
+
     import mimetypes
 
     mime, _ = mimetypes.guess_type(target)
     mime = mime or "application/octet-stream"
-    raw = await fs.read(target)
-    return Response(content=raw, media_type=mime)
+    fs._check_path(target)
+    return FileResponse(target, media_type=mime)
 
 
 @app.get(
@@ -901,7 +1280,7 @@ async def view_file(
 )
 async def serve_file(path: str, fs: UserFS = Depends(get_filesystem)):
     """Path-based alias for view_file — enables relative URL resolution in iframes."""
-    return await view_file(path=f"/{path}", fs=fs)
+    return await view_file(path=f"/{path}", preview=False, fs=fs)
 
 
 @app.post(
@@ -1037,10 +1416,8 @@ async def replace_file_content(http_request: Request, request: ReplaceRequest, f
 
     for chunk in request.replacements:
         if chunk.start_line or chunk.end_line:
-            lines = content.splitlines(keepends=True)
-            start = (chunk.start_line or 1) - 1
-            end = chunk.end_line or len(lines)
-            search_region = "".join(lines[start:end])
+            start, end = line_range_offsets(content, chunk.start_line, chunk.end_line)
+            search_region = content[start:end]
         else:
             search_region = content
 
@@ -1058,8 +1435,7 @@ async def replace_file_content(http_request: Request, request: ReplaceRequest, f
 
         if chunk.start_line or chunk.end_line:
             new_region = search_region.replace(chunk.target, chunk.replacement)
-            lines[start:end] = [new_region]
-            content = "".join(lines)
+            content = content[:start] + new_region + content[max(start, end):]
         else:
             content = content.replace(chunk.target, chunk.replacement)
 
@@ -1258,13 +1634,152 @@ async def grep_search(
 
         return matches, truncated
 
-    matches, truncated = await asyncio.to_thread(_search_sync)
+    matches, truncated = await run_io(_search_sync)
     return {
         "query": query,
         "path": target,
         "matches": matches,
         "truncated": truncated,
     }
+
+
+@app.get(
+    "/files/matches",
+    operation_id="match_files",
+    summary="Search files by name and contents",
+    description="Search files and directories by ranked name, path, and content matches.",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        400: {"description": "Blank query."},
+        404: {"description": "Search directory not found."},
+        401: {"description": "Invalid or missing API key."},
+    },
+)
+async def match_files(
+    http_request: Request,
+    query: str = Query(..., description="Literal text to match."),
+    path: str = Query(".", description="Directory to search within."),
+    show_hidden: bool = Query(False, description="Include hidden dotfiles and dot-directories."),
+    offset: int = Query(0, description="Result offset.", ge=0),
+    limit: int = Query(
+        MATCH_PAGE_SIZE,
+        description="Maximum number of results to return.",
+        ge=1,
+        le=MATCH_PAGE_SIZE,
+    ),
+    fs: UserFS = Depends(get_filesystem),
+):
+    query = query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query must not be blank")
+
+    session_id = http_request.headers.get("x-session-id")
+    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    target = fs.resolve_path(path, cwd=session_cwd)
+    if not fs.is_path_allowed(target) or not await aiofiles.os.path.isdir(target):
+        raise HTTPException(status_code=404, detail="Search directory not found")
+
+    def _matches_sync():
+        query_lower = query.lower()
+
+        def content_lines(path):
+            with open(path, encoding="utf-8", errors="replace", newline="\n" if rg_matches is not None else None) as source:
+                if rg_matches is not None:
+                    yield from enumerate(source, 1)
+                    return
+                number = 0
+                for line in source:
+                    for text in line.splitlines():
+                        number += 1
+                        yield number, text
+
+        def candidates():
+            for entry_path, entry_type in search_entries(fs, target, show_hidden):
+                rel_path = os.path.relpath(entry_path, target).replace("\\", "/")
+                name = os.path.basename(entry_path)
+                name_lower, rel_lower = name.lower(), rel_path.lower()
+                score = (0 if name_lower == query_lower else 1 if name_lower.startswith(query_lower)
+                    else 2 if query_lower in name_lower else 3 if query_lower in rel_lower else 4)
+                content_matches = []
+                if entry_type == "file" and not os.path.islink(entry_path):
+                    try:
+                        size = os.path.getsize(entry_path)
+                        eligible = rg_matches(entry_path) if rg_matches is not None else size <= MAX_CONTENT_SEARCH_FILE_SIZE
+                        if eligible:
+                            with open(entry_path, "rb") as source:
+                                binary = rg_matches is None and b"\0" in source.read(8192)
+                            for number, text in (() if binary else content_lines(entry_path)):
+                                index = text.lower().find(query_lower)
+                                if index >= 0:
+                                    content_matches.append({"line": number, "column": len(text[:index].encode("utf-16-le")) // 2 + 1, "text": text.rstrip("\r\n")})
+                                    if len(content_matches) >= MAX_CONTENT_MATCHES_PER_FILE:
+                                        break
+                    except (OSError, UnicodeError):
+                        pass
+                if score == 4 and not content_matches:
+                    continue
+                yield (score, len(rel_path), rel_lower, {
+                    "path": entry_path, "relative_path": rel_path, "name": name,
+                    "type": entry_type, "name_match": score < 4, "content_matches": content_matches,
+                })
+
+        with matching_files(query, target, show_hidden) as rg_matches:
+            return ranked_page(candidates(), offset, limit)
+
+    return await run_io(_matches_sync)
+
+
+@app.get(
+    "/files/search",
+    operation_id="search_files",
+    summary="Search files by name",
+    description="Search for files and subdirectories by ranked filename match.",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        404: {"description": "Search directory not found."},
+        401: {"description": "Invalid or missing API key."},
+    },
+)
+async def search_files(
+    http_request: Request,
+    query: str = Query("", description="Filename search term."),
+    path: str = Query(".", description="Directory to search within."),
+    limit: int = Query(20, description="Maximum number of matches to return.", ge=1, le=100),
+    type: Optional[str] = Query(
+        "any",
+        description="Type filter: 'file', 'directory', or 'any'.",
+        pattern="^(file|directory|any)$",
+    ),
+    show_hidden: bool = Query(False, description="Include hidden dotfiles and dot-directories."),
+    fs: UserFS = Depends(get_filesystem),
+):
+    session_id = http_request.headers.get("x-session-id")
+    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    target = fs.resolve_path(path, cwd=session_cwd)
+    if not fs.is_path_allowed(target) or not await aiofiles.os.path.isdir(target):
+        raise HTTPException(status_code=404, detail="Search directory not found")
+
+    def _search_sync():
+        query_lower = query.strip().lower()
+        def candidates():
+            for full_path, entry_type in search_entries(fs, target, show_hidden, git_files_as_files=True):
+                if type != "any" and entry_type != type:
+                    continue
+                name = os.path.basename(full_path)
+                lower = name.lower()
+                if query_lower and query_lower not in lower:
+                    continue
+                rank = 0 if lower == query_lower else 1 if lower.startswith(query_lower) else 2
+                try:
+                    info = os.stat(full_path)
+                except OSError:
+                    continue
+                yield (rank, len(name), os.path.relpath(full_path, target).lower(), {
+                    "path": full_path, "name": name, "type": entry_type, "size": info.st_size, "modified": info.st_mtime,
+                })
+        return [item[3] for item in heapq.nsmallest(limit, candidates(), key=lambda item: item[:3])]
+
+    return {"results": await run_io(_search_sync)}
 
 
 @app.get(
@@ -1361,7 +1876,7 @@ async def glob_search(
 
         return matches, truncated
 
-    matches, truncated = await asyncio.to_thread(_glob_sync)
+    matches, truncated = await run_io(_glob_sync)
     return {
         "pattern": pattern,
         "path": target,
@@ -1369,6 +1884,19 @@ async def glob_search(
         "truncated": truncated,
     }
 
+
+
+
+class UploadParser(MultiPartParser):
+    async def parse(self):
+        try:
+            return await super().parse()
+        except BaseException:
+            # Starlette closes these on MultiPartException only. Disconnects,
+            # cancellation and other read errors must release spools as well.
+            for file in self._files_to_close_on_error:
+                file.close()
+            raise
 
 
 
@@ -1384,26 +1912,48 @@ async def glob_search(
     },
 )
 async def upload_file(
+    http_request: Request,
     directory: str = Query(..., description="Destination directory for the file."),
-    file: UploadFile = File(
-        ..., description="The file to upload."
-    ),
     fs: UserFS = Depends(get_filesystem),
 ):
-    content = await file.read()
+    try:
+        content_type, _ = parse_options_header(http_request.headers.get("content-type"))
+        if content_type == b"multipart/form-data":
+            form = await UploadParser(http_request.headers, http_request.stream()).parse()
+        else:
+            form = await http_request.form()
+    except MultiPartException as exc:
+        raise HTTPException(400, exc.message) from None
+    file = form.get("file")
+    try:
+        if file is None or file == "":
+            raise RequestValidationError([{"type": "missing", "loc": ("body", "file"), "msg": "Field required", "input": None}])
+        file = TypeAdapter(UploadFile).validate_python(file)
+    except ValidationError as exc:
+        await form.close()
+        raise RequestValidationError([{**error, "loc": ("body", "file", *error["loc"])} for error in exc.errors(include_url=False)]) from exc
+    except BaseException:
+        await form.close()
+        raise
     filename = os.path.basename(file.filename or "upload")
-
     directory = fs.resolve_path(directory)
     path = os.path.normpath(os.path.join(directory, filename))
-
+    size = 0
     try:
+        fs._check_path(path)
         await fs.mkdir(directory)
-        await fs.write_bytes(path, content)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except OSError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"path": path, "size": len(content)}
+        async with aiofiles.open(path, "wb") as output:
+            while chunk := await file.read(CHUNK_SIZE):
+                size += len(chunk)
+                await output.write(chunk)
+        await fs._chown(path)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc))
+    except OSError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        await form.close()
+    return {"path": path, "size": size}
 
 
 class ArchiveRequest(BaseModel):
@@ -1423,7 +1973,6 @@ async def archive_paths(
     fs: UserFS = Depends(get_filesystem),
 ):
     """Bundle files and/or directories into a single ZIP archive."""
-    import io
     import zipfile
 
     if not request.paths:
@@ -1442,37 +1991,46 @@ async def archive_paths(
     else:
         archive_name = "download"
 
-    def _build_zip() -> bytes:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for target in resolved:
-                if os.path.isfile(target):
-                    zf.write(target, os.path.basename(target))
-                elif os.path.isdir(target):
-                    dirname = os.path.basename(target.rstrip("/\\")) or "dir"
-                    for dirpath, dirnames, filenames in os.walk(target):
-                        dirnames[:] = [
-                            d for d in dirnames
-                            if fs.is_path_allowed(os.path.join(dirpath, d))
-                        ]
-                        for fname in filenames:
-                            full = os.path.join(dirpath, fname)
-                            if not fs.is_path_allowed(full):
-                                continue
-                            arcname = os.path.join(
-                                dirname, os.path.relpath(full, target)
-                            )
-                            zf.write(full, arcname)
-        return buf.getvalue()
+    fd, temporary = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    stop = threading.Event()
 
-    data = await asyncio.to_thread(_build_zip)
-    return Response(
-        content=data,
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{archive_name}.zip"',
-        },
-    )
+    def archive_files(target):
+        if os.path.isfile(target):
+            yield target
+        elif os.path.isdir(target):
+            for directory, dirs, files in os.walk(target):
+                dirs[:] = [name for name in dirs if fs.is_path_allowed(os.path.join(directory, name))]
+                for name in files:
+                    full = os.path.join(directory, name)
+                    if fs.is_path_allowed(full):
+                        yield full
+
+    def _build_zip():
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+            for target in resolved:
+                fs._check_path(target)
+                for full in archive_files(target):
+                    if stop.is_set():
+                        return
+                    arcname = os.path.basename(full) if full == target else os.path.join(os.path.basename(target.rstrip("/\\")) or "dir", os.path.relpath(full, target))
+                    info = zipfile.ZipInfo.from_file(full, arcname)
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    with open(full, "rb") as source, archive.open(info, "w") as destination:
+                        while chunk := source.read(CHUNK_SIZE):
+                            if stop.is_set():
+                                return
+                            destination.write(chunk)
+
+    task = asyncio.create_task(asyncio.to_thread(_build_zip))
+    try:
+        await asyncio.shield(task)
+        return TemporaryFileResponse(temporary, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{archive_name}.zip"'})
+    except BaseException:
+        stop.set()
+        await asyncio.gather(task, return_exceptions=True)
+        os.unlink(temporary)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1485,7 +2043,7 @@ async def archive_paths(
     operation_id="list_processes",
     summary="List tracked commands",
     description=(
-        "List tracked commands started by run_command.\n\n"
+        "List tracked commands started by run_command for the current user and chat.\n\n"
         "Use when: you need to find active or recently finished process_ids before "
         "polling, sending input, or terminating a command.\n"
         "Inputs: none.\n"
@@ -1499,7 +2057,7 @@ async def archive_paths(
         401: {"description": "Invalid or missing API key."},
     },
 )
-async def list_processes():
+async def list_processes(http_request: Request):
     _cleanup_expired()
     return [
         {
@@ -1510,7 +2068,98 @@ async def list_processes():
             "log_path": background_process.log_path,
         }
         for background_process in _processes.values()
+        if background_process.user_id == http_request.headers.get("x-user-id", "")
+        and background_process.session_id == http_request.headers.get("x-session-id", "")
     ]
+
+
+async def _stream_websocket(ws, send):
+    """Stop delivery on disconnect without stopping the underlying command."""
+    async def receive():
+        while (await ws.receive())["type"] != "websocket.disconnect":
+            pass
+
+    tasks = [asyncio.create_task(send()), asyncio.create_task(receive())]
+    close_code = 1000
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        close_code = 1011
+        log.exception("Command stream failed")
+    finally:
+        import anyio
+        with anyio.CancelScope(shield=True):
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await ws.close(code=close_code)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+
+
+async def _command_socket_request(ws):
+    payload = await _authenticate_websocket(ws)
+    if payload is None:
+        return None
+    headers = list(ws.scope["headers"])
+    if "x-session-id" not in ws.headers:
+        headers.append((b"x-session-id", payload.get("chat_id", "").encode()))
+    return Request({**ws.scope, "type": "http", "method": "GET", "headers": headers})
+
+
+@app.websocket("/execute")
+async def stream_processes(ws: WebSocket):
+    request = await _command_socket_request(ws)
+    if request is None:
+        return
+
+    async def send():
+        previous = None
+        while True:
+            changed = _process_list_changed
+            processes = await list_processes(request)
+            if processes != previous:
+                await ws.send_json(processes)
+                previous = processes
+            await changed.wait()
+
+    await _stream_websocket(ws, send)
+
+
+@app.websocket("/execute/{process_id}/status")
+async def stream_process_output(ws: WebSocket, process_id: str,
+                                offset: int = Query(0, ge=0),
+                                tail: int = Query(1000, ge=1, le=1000)):
+    request = await _command_socket_request(ws)
+    if request is None:
+        return
+    try:
+        process = _get_process(process_id, request)
+    except HTTPException:
+        await ws.close(code=4004, reason="Process not found")
+        return
+
+    async def send():
+        reader = LogReader(process.log_path, offset, tail)
+        while True:
+            changed = process.changed
+            finished = process.finished_at is not None
+            output, next_offset, truncated = await reader.read()
+            await ws.send_json({"id": process.id, "command": process.command,
+                                "status": process.status if finished else "running",
+                                "exit_code": process.exit_code if finished else None,
+                                "output": output, "next_offset": next_offset,
+                                "truncated": truncated})
+            if finished:
+                return
+            await changed.wait()
+
+    await _stream_websocket(ws, send)
 
 
 @app.post(
@@ -1519,6 +2168,7 @@ async def list_processes():
     summary="Execute a command",
     description=_EXECUTE_DESCRIPTION,
     response_model=ProcessStatusResponse,
+    response_model_exclude_unset=True,
     dependencies=[Depends(verify_api_key)],
     responses={
         401: {"description": "Invalid or missing API key."},
@@ -1539,23 +2189,24 @@ async def execute(
         ge=1,
     ),
 ):
+    _cleanup_expired()
     fs = get_filesystem(http_request)
     session_id = http_request.headers.get("x-session-id")
     session_cwd = _get_session_cwd(session_id, fs) if session_id else None
     cwd = fs.resolve_path(request.cwd, cwd=session_cwd) if request.cwd else (session_cwd or fs.home)
 
-    subprocess_env = {**os.environ, **request.env} if request.env else None
-    runner = await create_runner(
-        request.command, cwd, subprocess_env, run_as_user=fs.username
-    )
+    runner = await create_runner(request.command, cwd, request.env, run_as_user=fs.username)
 
     process_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     log_path = os.path.join(LOG_DIR, "processes", f"{process_id}.jsonl")
     background_process = BackgroundProcess(
-        id=process_id, command=request.command, runner=runner, log_path=log_path
+        id=process_id, command=request.command, runner=runner, log_path=log_path,
+        user_id=http_request.headers.get("x-user-id", ""),
+        session_id=http_request.headers.get("x-session-id", ""),
     )
-    background_process.log_task = asyncio.create_task(log_process(background_process))
+    background_process.log_task = asyncio.create_task(log_process(background_process, on_finish=_notify_process_list))
     _processes[process_id] = background_process
+    _notify_process_list()
 
     if wait is None and EXECUTE_TIMEOUT:
         wait = EXECUTE_TIMEOUT
@@ -1567,20 +2218,14 @@ async def execute(
         except asyncio.TimeoutError:
             pass
 
-    output, next_offset, truncated = await read_log(
-        background_process.log_path, offset=0, tail=tail
-    )
-
-    return {
+    return await log_response(background_process.log_path, {
         "id": process_id,
         "command": request.command,
+        "cwd": cwd,
         "status": background_process.status,
         "exit_code": background_process.exit_code,
-        "output": output,
-        "truncated": truncated,
-        "next_offset": next_offset,
         "log_path": background_process.log_path,
-    }
+    }, offset=0, tail=tail)
 
 
 @app.get(
@@ -1601,6 +2246,7 @@ async def execute(
         "authentication failed; 422 means request validation failed."
     ),
     response_model=ProcessStatusResponse,
+    response_model_exclude_unset=True,
     dependencies=[Depends(verify_api_key)],
     responses={
         404: {"description": "Process not found."},
@@ -1608,6 +2254,7 @@ async def execute(
     },
 )
 async def get_status(
+    http_request: Request,
     process_id: str = PathParam(
         ...,
         description="The process_id returned by run_command.",
@@ -1629,7 +2276,7 @@ async def get_status(
         ge=1,
     ),
 ):
-    background_process = _get_process(process_id)
+    background_process = _get_process(process_id, http_request)
 
     if wait is None and EXECUTE_TIMEOUT:
         wait = EXECUTE_TIMEOUT
@@ -1641,20 +2288,13 @@ async def get_status(
         except asyncio.TimeoutError:
             pass
 
-    output, next_offset, truncated = await read_log(
-        background_process.log_path, offset=offset, tail=tail
-    )
-
-    return {
+    return await log_response(background_process.log_path, {
         "id": background_process.id,
         "command": background_process.command,
         "status": background_process.status,
         "exit_code": background_process.exit_code,
-        "output": output,
-        "truncated": truncated,
-        "next_offset": next_offset,
         "log_path": background_process.log_path,
-    }
+    }, offset=offset, tail=tail)
 
 
 @app.post(
@@ -1683,12 +2323,13 @@ async def get_status(
 )
 async def send_input(
     body: InputRequest,
+    http_request: Request,
     process_id: str = PathParam(
         ...,
         description="The process_id returned by run_command.",
     ),
 ):
-    background_process = _get_process(process_id)
+    background_process = _get_process(process_id, http_request)
     if background_process.status != "running":
         raise HTTPException(status_code=400, detail="Process has already exited")
 
@@ -1697,9 +2338,13 @@ async def send_input(
     text = body.input.encode("raw_unicode_escape").decode("unicode_escape")
 
     try:
-        background_process.runner.write_input(text.encode())
-        if isinstance(background_process.runner, PipeRunner):
-            await background_process.runner.drain_input()
+        async with background_process.input_lock:
+            if isinstance(background_process.runner, PtyRunner):
+                await write_pty(background_process.runner._master_fd, text.encode())
+            else:
+                background_process.runner.write_input(text.encode())
+            if isinstance(background_process.runner, PipeRunner):
+                await background_process.runner.drain_input()
     except (BrokenPipeError, ConnectionResetError, OSError):
         raise HTTPException(status_code=400, detail="Process stdin is closed")
 
@@ -1731,20 +2376,20 @@ async def send_input(
     },
 )
 async def kill_process(
+    http_request: Request,
     process_id: str = PathParam(
         ...,
         description="The process_id returned by run_command.",
     ),
     force: bool = Query(False, description="Request forceful termination instead of graceful termination."),
 ):
-    background_process = _get_process(process_id)
+    background_process = _get_process(process_id, http_request)
     if background_process.status == "running":
-        background_process.runner.kill(force=force)
-        exit_code = await background_process.runner.wait()
-        background_process.runner.close()
         background_process.status = "killed"
-        background_process.exit_code = exit_code
-    del _processes[process_id]
+        background_process.runner.kill(force=force)
+        # The log task owns draining, reaping and closing the runner.
+        await asyncio.shield(background_process.log_task)
+    background_process.finished_at = time.time()
     return {"status": "killed"}
 
 
@@ -1752,7 +2397,33 @@ async def kill_process(
 # Port detection & proxy
 # ---------------------------------------------------------------------------
 
-from open_terminal.utils.port import detect_listening_ports, get_descendant_pids
+from open_terminal.utils.port import detect_listening_ports, get_descendant_pids, watch_listening_ports
+
+
+async def _visible_ports(request: Request, all_ports=None) -> list[dict]:
+    if all_ports is None:
+        all_ports = await run_io(detect_listening_ports)
+
+    try:
+        fs = get_filesystem(request)
+    except Exception:
+        # User provisioning failed (e.g. useradd rejected in restricted
+        # container runtimes).  An unprovisioned user has no ports.
+        return []
+
+    if fs.username:
+        # Filter by user UID
+        import pwd
+        try:
+            user_uid = pwd.getpwnam(fs.username).pw_uid
+            return [p for p in all_ports if p.get("uid") == user_uid]
+        except KeyError:
+            return []
+
+    own_pid = os.getpid()
+    descendant_pids = await run_io(get_descendant_pids, own_pid)
+    return [p for p in all_ports if p.get("pid") in descendant_pids]
+
 
 @app.get(
     "/ports",
@@ -1765,27 +2436,7 @@ async def list_ports(request: Request):
     In multi-user mode, only shows ports owned by the requesting user.
     In single-user mode, shows ports owned by descendant processes.
     """
-    all_ports = await asyncio.to_thread(detect_listening_ports)
-
-    try:
-        fs = get_filesystem(request)
-    except Exception:
-        # User provisioning failed (e.g. useradd rejected in restricted
-        # container runtimes).  An unprovisioned user has no ports.
-        return {"ports": []}
-
-    if fs.username:
-        # Filter by user UID
-        import pwd
-        try:
-            user_uid = pwd.getpwnam(fs.username).pw_uid
-            all_ports = [p for p in all_ports if p.get("uid") == user_uid]
-        except KeyError:
-            all_ports = []
-    else:
-        own_pid = os.getpid()
-        descendant_pids = await asyncio.to_thread(get_descendant_pids, own_pid)
-        all_ports = [p for p in all_ports if p.get("pid") in descendant_pids]
+    all_ports = await _visible_ports(request)
 
     # Strip uid from response (internal detail)
     for p in all_ports:
@@ -1820,6 +2471,9 @@ async def port_proxy(port: int, path: str, request: Request):
     if port < 1 or port > 65535:
         raise HTTPException(status_code=422, detail="Port must be between 1 and 65535")
 
+    if not any(p.get("port") == port for p in await _visible_ports(request)):
+        raise HTTPException(status_code=404, detail="Port not found")
+
     target_url = f"http://localhost:{port}/{path}"
     if request.query_params:
         target_url += f"?{request.query_params}"
@@ -1829,18 +2483,14 @@ async def port_proxy(port: int, path: str, request: Request):
     for h in ("host", "transfer-encoding", "connection", "authorization"):
         headers.pop(h, None)
 
-    body = await request.body()
-
     import httpx
 
     client = await _get_port_proxy_client()
     try:
-        upstream = await client.request(
-            method=request.method,
-            url=target_url,
-            headers=headers,
-            content=body or None,
+        upstream_request = client.build_request(
+            method=request.method, url=target_url, headers=headers, content=request.stream(),
         )
+        upstream = await client.send(upstream_request, stream=True)
     except httpx.ConnectError:
         raise HTTPException(
             status_code=502,
@@ -1856,11 +2506,14 @@ async def port_proxy(port: int, path: str, request: Request):
     for h in ("transfer-encoding", "connection", "content-encoding", "content-length"):
         response_headers.pop(h, None)
 
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=response_headers,
-    )
+    class ProxyResponse(StreamingResponse):
+        async def __call__(self, scope, receive, send):
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                await upstream.aclose()
+
+    return ProxyResponse(upstream.aiter_bytes(), status_code=upstream.status_code, headers=response_headers)
 
 
 # ---------------------------------------------------------------------------
@@ -1872,11 +2525,6 @@ if ENABLE_TERMINAL:
     import uuid as _uuid
     from datetime import datetime as _datetime
     from fastapi.responses import JSONResponse
-
-    try:
-        import select as _select
-    except ImportError:
-        _select = None  # Not available on all platforms in all contexts
 
     # Determine terminal backend: prefer Unix PTY, then pywinpty, else None
     if _PTY_AVAILABLE:
@@ -1893,7 +2541,7 @@ if ENABLE_TERMINAL:
     _terminal_sessions: dict[str, dict] = {}
 
 
-    def _cleanup_session(session_id: str):
+    async def _cleanup_session(session_id: str):
         """Clean up a terminal session's resources.
 
         For PTY sessions the shell is spawned with ``start_new_session=True``,
@@ -1905,6 +2553,11 @@ if ENABLE_TERMINAL:
         if session is None:
             return
 
+        tasks = session.get("io_tasks", ())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
         backend = session.get("backend")
 
         if backend == "pty":
@@ -1914,21 +2567,21 @@ if ENABLE_TERMINAL:
                 pass
 
             process = session["process"]
-            if process.poll() is None:
-                # Signal the whole process group first (graceful).
+            # The leader may have exited while background children remain.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                await asyncio.to_thread(process.wait, timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
                 try:
-                    os.killpg(process.pid, signal.SIGTERM)
+                    os.killpg(process.pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    # Forceful kill of the entire group.
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                    process.wait()
+                await asyncio.to_thread(process.wait)
 
         elif backend == "winpty":
             pty_proc = session["pty_process"]
@@ -1951,7 +2604,7 @@ if ENABLE_TERMINAL:
         else:
             dead = [sid for sid, s in _terminal_sessions.items() if not s["pty_process"].isalive()]
         for sid in dead:
-            _cleanup_session(sid)
+            await _cleanup_session(sid)
 
         if len(_terminal_sessions) >= MAX_TERMINAL_SESSIONS:
             return JSONResponse(
@@ -1976,8 +2629,8 @@ if ENABLE_TERMINAL:
                 fs = get_filesystem(request)
 
                 # Use per-session cwd if available, else fall back to home
-                session_id = request.headers.get("x-session-id", session_id)
-                session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+                chat_id = request.headers.get("x-session-id")
+                session_cwd = _get_session_cwd(chat_id, fs) if chat_id else None
 
                 if fs.username:
                     shell_cmd = [
@@ -1990,7 +2643,7 @@ if ENABLE_TERMINAL:
                     shell_cmd = [os.environ.get("SHELL", "/bin/sh")]
                     cwd = session_cwd or os.getcwd()
 
-                spawn_env = os.environ.copy()
+                spawn_env = sanitized_environ()
                 spawn_env.setdefault("TERM", TERMINAL_TERM)
                 process = subprocess.Popen(
                     shell_cmd,
@@ -2021,7 +2674,7 @@ if ENABLE_TERMINAL:
 
         else:  # winpty
             shell = os.environ.get("COMSPEC", "cmd.exe")
-            spawn_env = os.environ.copy()
+            spawn_env = sanitized_environ()
             spawn_env.setdefault("TERM", TERMINAL_TERM)
             pty_proc = _WinPtyProcess.spawn(
                 [shell],
@@ -2037,6 +2690,13 @@ if ENABLE_TERMINAL:
             }
 
         session = _terminal_sessions[session_id]
+        session.update(
+            user_id=request.headers.get("x-user-id", ""),
+            chat_id=request.headers.get("x-session-id", ""),
+            output=bytearray(),
+            connected=False,
+            input_lock=asyncio.Lock(),
+        )
         return {
             "id": session_id,
             "created_at": session["created_at"],
@@ -2052,12 +2712,68 @@ if ENABLE_TERMINAL:
             return session["pty_process"].isalive()
 
 
+    def _owns_terminal(session: dict, request) -> bool:
+        return (
+            session["user_id"] == request.headers.get("x-user-id", "")
+            and session["chat_id"] == request.headers.get("x-session-id", "")
+        )
+
+
+    def _set_terminal_active(session: dict, active: bool):
+        if active and not session.get("active", False):
+            session["last_active"] = time.monotonic_ns()
+        session["active"] = active
+
+
+    def _user_terminal(request: Request) -> dict:
+        sessions = [
+            session for session in reversed(_terminal_sessions.values())
+            if _owns_terminal(session, request) and session["connected"] and _session_is_alive(session)
+        ]
+        if sessions:
+            return max(sessions, key=lambda session: (session.get("active", False), session.get("last_active", 0)))
+        raise HTTPException(status_code=404, detail="No connected user shell")
+
+
+    async def _write_terminal(session: dict, data: bytes):
+        async with session["input_lock"]:
+            if session["backend"] == "pty":
+                await write_pty(session["master_fd"], data)
+            else:
+                await asyncio.to_thread(session["pty_process"].write, data.decode(errors="replace"))
+
+
+    @app.get("/api/terminals/user/output", operation_id="read_user_terminal", dependencies=[Depends(verify_api_key)])
+    async def read_user_terminal(request: Request):
+        """Read recent output from the user's active shell, or last-used shell when none is visible.
+        Inspect before sending input:
+        a foreground program may already be running. Does not create a shell."""
+        session = _user_terminal(request)
+        return {"output": bytes(session["output"]).decode(errors="replace")}
+
+
+    @app.post("/api/terminals/user/input", operation_id="send_user_terminal_input", dependencies=[Depends(verify_api_key)])
+    async def send_user_terminal_input(request: Request, body: InputRequest):
+        """Send literal text to the user's active shell, or last-used shell when none is visible.
+        Input goes to that shell or its foreground program.
+        Include actual newlines to submit input. Read the shell first. Sending input
+        does not wait for command completion and does not create a shell."""
+        session = _user_terminal(request)
+        try:
+            await _write_terminal(session, body.input.encode())
+        except (OSError, EOFError):
+            raise HTTPException(status_code=409, detail="User shell has disconnected")
+        return {"status": "ok"}
+
+
     @app.get("/api/terminals", dependencies=[Depends(verify_api_key)], include_in_schema=False)
     async def list_terminals(request: Request):
         """List active terminal sessions."""
         result = []
         to_remove = []
         for sid, session in _terminal_sessions.items():
+            if not _owns_terminal(session, request):
+                continue
             if not _session_is_alive(session):
                 to_remove.append(sid)
                 continue
@@ -2067,7 +2783,7 @@ if ENABLE_TERMINAL:
                 "pid": session["pid"],
             })
         for sid in to_remove:
-            _cleanup_session(sid)
+            await _cleanup_session(sid)
         return result
 
 
@@ -2075,10 +2791,10 @@ if ENABLE_TERMINAL:
     async def get_terminal(session_id: str, request: Request):
         """Get info about a terminal session."""
         session = _terminal_sessions.get(session_id)
-        if session is None:
+        if session is None or not _owns_terminal(session, request):
             return JSONResponse({"error": "Session not found"}, status_code=404)
         if not _session_is_alive(session):
-            _cleanup_session(session_id)
+            await _cleanup_session(session_id)
             return JSONResponse({"error": "Session not found"}, status_code=404)
         return {
             "id": session_id,
@@ -2090,9 +2806,9 @@ if ENABLE_TERMINAL:
     @app.delete("/api/terminals/{session_id}", dependencies=[Depends(verify_api_key)], include_in_schema=False)
     async def delete_terminal(session_id: str, request: Request):
         """Kill and remove a terminal session."""
-        if session_id not in _terminal_sessions:
+        if session_id not in _terminal_sessions or not _owns_terminal(_terminal_sessions[session_id], request):
             return JSONResponse({"error": "Session not found"}, status_code=404)
-        _cleanup_session(session_id)
+        await _cleanup_session(session_id)
         return {"status": "deleted"}
 
 
@@ -2112,6 +2828,17 @@ if ENABLE_TERMINAL:
         To resize, send a **text** JSON frame::
 
             {"type": "resize", "cols": 120, "rows": 40}
+
+        Report tab visibility so user-shell tools select the active or last-used shell::
+
+            {"type": "activity", "active": true}
+
+        Attach a shell opened before the chat existed, without restarting it::
+
+            {"type": "chat", "chat_id": "<new_chat_id>"}
+
+        The server replies with the same type and chat_id, or an error. A shell
+        already assigned to a different chat cannot be reassigned.
         """
         session = _terminal_sessions.get(session_id)
         if session is None:
@@ -2119,25 +2846,25 @@ if ENABLE_TERMINAL:
             return
 
         if not _session_is_alive(session):
-            _cleanup_session(session_id)
+            await _cleanup_session(session_id)
             await ws.close(code=4004, reason="Session has ended")
             return
 
-        await ws.accept()
-
-        # First-message authentication
-        if API_KEY:
-            try:
-                msg = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
-                payload = json.loads(msg)
-                if payload.get("type") != "auth" or not hmac.compare_digest(payload.get("token", ""), API_KEY):
-                    await ws.close(code=4001, reason="Invalid API key")
-                    return
-            except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
-                await ws.close(code=4001, reason="Auth timeout or invalid payload")
-                return
+        payload = await _authenticate_websocket(ws)
+        if payload is None:
+            return
+        if (
+            session["user_id"] != ws.headers.get("x-user-id", "")
+            or session["chat_id"] != ws.headers.get("x-session-id", payload.get("chat_id", ""))
+        ):
+            await ws.close(code=4004, reason="Session not found")
+            return
 
         backend = session["backend"]
+        if session["connected"]:
+            await ws.close(code=4009, reason="Session already connected")
+            return
+        session["connected"] = True
         loop = asyncio.get_event_loop()
         stop_event = asyncio.Event()
 
@@ -2146,23 +2873,6 @@ if ENABLE_TERMINAL:
         if backend == "pty":
             master_fd = session["master_fd"]
             process = session["process"]
-
-            def _blocking_read():
-                """Read from PTY using select() so we don't block forever."""
-                while not stop_event.is_set():
-                    try:
-                        rlist, _, _ = _select.select([master_fd], [], [], 0.1)
-                        if rlist:
-                            return os.read(master_fd, 4096)
-                    except (OSError, ValueError):
-                        return b""
-                return b""
-
-            def _check_alive():
-                return process.poll() is None
-
-            def _write_data(data: bytes):
-                os.write(master_fd, data)
 
             def _do_resize(rows: int, cols: int):
                 fcntl.ioctl(
@@ -2184,12 +2894,6 @@ if ENABLE_TERMINAL:
                 except Exception:
                     return b""
 
-            def _check_alive():
-                return pty_proc.isalive()
-
-            def _write_data(data: bytes):
-                pty_proc.write(data.decode(errors="replace"))
-
             def _do_resize(rows: int, cols: int):
                 pty_proc.setwinsize(rows, cols)
 
@@ -2197,31 +2901,21 @@ if ENABLE_TERMINAL:
 
         async def _pty_reader():
             """Forward PTY output -> WebSocket."""
-            try:
-                while not stop_event.is_set():
-                    data = await loop.run_in_executor(None, _blocking_read)
-                    if not data:
-                        if stop_event.is_set():
-                            break
-                        if not _check_alive():
-                            break
-                        continue
-                    try:
-                        await ws.send_bytes(data)
-                    except Exception:
-                        break
-            finally:
-                pass
+            while not stop_event.is_set():
+                data = await read_pty(master_fd) if backend == "pty" else await loop.run_in_executor(None, _blocking_read)
+                if not data:
+                    break
+                session["output"].extend(data)
+                del session["output"][:-65536]
+                await ws.send_bytes(data)
 
-        reader_task = asyncio.create_task(_pty_reader())
-
-        try:
+        async def _ws_reader():
             while True:
                 msg = await ws.receive()
                 if msg["type"] == "websocket.disconnect":
                     break
                 elif "bytes" in msg and msg["bytes"]:
-                    await loop.run_in_executor(None, _write_data, msg["bytes"])
+                    await _write_terminal(session, msg["bytes"])
                 elif "text" in msg and msg["text"]:
                     try:
                         payload = json.loads(msg["text"])
@@ -2229,19 +2923,34 @@ if ENABLE_TERMINAL:
                             cols = payload.get("cols", 80)
                             rows = payload.get("rows", 24)
                             _do_resize(rows, cols)
+                        elif payload.get("type") == "activity" and isinstance(payload.get("active"), bool):
+                            _set_terminal_active(session, payload["active"])
+                        elif payload.get("type") == "chat":
+                            chat_id = payload.get("chat_id")
+                            if not isinstance(chat_id, str) or not 1 <= len(chat_id) <= 128:
+                                await ws.send_json({"type": "chat", "error": "Invalid chat ID"})
+                            elif session["chat_id"] and session["chat_id"] != chat_id:
+                                await ws.send_json({"type": "chat", "error": "Terminal already belongs to another chat"})
+                            else:
+                                # The socket already authenticated this shell's owner. Keep the PTY alive.
+                                session["chat_id"] = chat_id
+                                await ws.send_json({"type": "chat", "chat_id": chat_id})
                     except (json.JSONDecodeError, KeyError):
                         pass
-        except WebSocketDisconnect:
-            pass
+        tasks = (asyncio.create_task(_pty_reader()), asyncio.create_task(_ws_reader()))
+        session["io_tasks"] = tasks
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
             stop_event.set()
-            reader_task.cancel()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await _cleanup_session(session_id)
             try:
-                await reader_task
-            except (asyncio.CancelledError, Exception):
+                await ws.close()
+            except (WebSocketDisconnect, RuntimeError):
                 pass
-            # Clean up session on disconnect
-            _cleanup_session(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2249,6 +2958,15 @@ if ENABLE_TERMINAL:
 # ---------------------------------------------------------------------------
 
 if ENABLE_NOTEBOOKS:
-    from open_terminal.utils.notebooks import create_notebooks_router
+    from open_terminal.utils import notebooks
 
-    app.include_router(create_notebooks_router(verify_api_key))
+    app.include_router(notebooks.router)
+
+# Browser tabs share the terminal's authenticated user and chat context.
+if ENABLE_BROWSER:
+    from open_terminal.browser.router import router as browser_router
+    app.include_router(browser_router)
+
+if ENABLE_DESKTOP:
+    from open_terminal.desktop import router as desktop_router, available as desktop_available
+    app.include_router(desktop_router, include_in_schema=desktop_available())

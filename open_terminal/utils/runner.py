@@ -7,6 +7,8 @@ import subprocess
 import time
 from abc import ABC, abstractmethod
 
+from open_terminal.env import sanitized_environ
+
 try:
     import fcntl
     import pty
@@ -23,6 +25,45 @@ try:
     _WINPTY_AVAILABLE = True
 except ImportError:
     _WINPTY_AVAILABLE = False
+
+
+async def read_pty(fd: int) -> bytes:
+    """Wait for descriptor readiness without occupying a worker thread."""
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            return os.read(fd, 4096)
+        except BlockingIOError:
+            ready = loop.create_future()
+            def readable():
+                if not ready.done():
+                    ready.set_result(None)
+            loop.add_reader(fd, readable)
+            try:
+                await ready
+            finally:
+                loop.remove_reader(fd)
+        except OSError:
+            return b""
+
+
+async def write_pty(fd: int, data: bytes):
+    loop = asyncio.get_running_loop()
+    remaining = memoryview(data)
+    while remaining:
+        try:
+            written = os.write(fd, remaining)
+            remaining = remaining[written:]
+        except BlockingIOError:
+            ready = loop.create_future()
+            def writable():
+                if not ready.done():
+                    ready.set_result(None)
+            loop.add_writer(fd, writable)
+            try:
+                await ready
+            finally:
+                loop.remove_writer(fd)
 
 
 class ProcessRunner(ABC):
@@ -74,7 +115,7 @@ class PtyRunner(ProcessRunner):
                 stdout=slave_fd,
                 stderr=slave_fd,
                 cwd=cwd,
-                env=env,
+                env=sanitized_environ(env),
                 start_new_session=True,
             )
         except Exception:
@@ -83,12 +124,12 @@ class PtyRunner(ProcessRunner):
             raise
         os.close(slave_fd)
         self._master_fd = master_fd
+        os.set_blocking(master_fd, False)
 
     async def read_output(self, log_file) -> None:
-        loop = asyncio.get_event_loop()
         while True:
             try:
-                data = await loop.run_in_executor(None, os.read, self._master_fd, 4096)
+                data = await read_pty(self._master_fd)
                 if not data:
                     break
             except OSError:
@@ -125,13 +166,17 @@ class PtyRunner(ProcessRunner):
         self._signal_group(signal.SIGKILL if force else signal.SIGTERM)
 
     async def wait(self) -> int:
-        return await asyncio.to_thread(self._process.wait)
+        while self._process.poll() is None:
+            await asyncio.sleep(0.05)
+        return self._process.returncode
 
     def close(self) -> None:
-        try:
-            os.close(self._master_fd)
-        except OSError:
-            pass
+        if self._master_fd is not None:
+            fd, self._master_fd = self._master_fd, None
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     @property
     def pid(self) -> int:
@@ -145,11 +190,12 @@ class PipeRunner(ProcessRunner):
         self._process: asyncio.subprocess.Process = None  # type: ignore[assignment]
         self._command = command
         self._cwd = cwd
-        self._env = env
+        self._env = sanitized_environ(env)
 
     async def start(self) -> None:
         self._process = await asyncio.create_subprocess_shell(
             self._command,
+            start_new_session=os.name != "nt",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE,
@@ -172,10 +218,9 @@ class PipeRunner(ProcessRunner):
                         + "\n"
                     )
 
-        await asyncio.gather(
-            read_stream(self._process.stdout, "stdout"),
-            read_stream(self._process.stderr, "stderr"),
-        )
+        async with asyncio.TaskGroup() as readers:
+            readers.create_task(read_stream(self._process.stdout, "stdout"))
+            readers.create_task(read_stream(self._process.stderr, "stderr"))
 
     def write_input(self, data: bytes) -> None:
         self._process.stdin.write(data)
@@ -184,19 +229,33 @@ class PipeRunner(ProcessRunner):
         await self._process.stdin.drain()
 
     def kill(self, force: bool = False) -> None:
+        if os.name == "nt":
+            if self._process.returncode is None:
+                self._process.kill() if force else self._process.terminate()
+            return
         sig = signal.SIGKILL if force else signal.SIGTERM
         try:
             os.killpg(self._process.pid, sig)
         except (ProcessLookupError, PermissionError, OSError):
             # No dedicated process group — fall back to the child directly.
-            self._process.send_signal(sig)
+            try:
+                self._process.send_signal(sig)
+            except ProcessLookupError:
+                pass
 
     async def wait(self) -> int:
+        # After a timeout cancels the readers, paused pipe transports can keep
+        # wait() pending even after the child is killed. Drain before reaping.
+        async def discard(stream):
+            while await stream.read(4096):
+                pass
+        await asyncio.gather(discard(self._process.stdout), discard(self._process.stderr))
         await self._process.wait()
         return self._process.returncode
 
     def close(self) -> None:
-        pass  # pipes are cleaned up automatically
+        if self._process.stdin:
+            self._process.stdin.close()
 
     @property
     def pid(self) -> int:
@@ -207,9 +266,7 @@ class WinPtyRunner(ProcessRunner):
     """Spawn a command under a Windows pseudo-terminal (ConPTY via pywinpty)."""
 
     def __init__(self, command: str, cwd: str | None, env: dict | None):
-        spawn_env = os.environ.copy()
-        if env:
-            spawn_env.update(env)
+        spawn_env = sanitized_environ(env)
 
         # Determine the executable and arguments.
         # PtyProcess.spawn expects a list: [executable, *args]

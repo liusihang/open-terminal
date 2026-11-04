@@ -1,0 +1,55 @@
+FROM python:3.12.13-slim AS builder
+
+WORKDIR /src
+
+COPY pyproject.toml README.md uv.lock* ./
+COPY open_terminal/ open_terminal/
+
+RUN pip install --no-cache-dir --prefix=/install .
+
+
+FROM python:3.12.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV HOME=/home/user
+ENV SHELL=/bin/bash
+ENV OPEN_TERMINAL_BROWSER_NO_SANDBOX=true
+ENV USER=user
+ENV XDG_CONFIG_HOME=/home/user/.config
+ENV XDG_STATE_HOME=/home/user/.local/state
+ENV XDG_CACHE_HOME=/home/user/.cache
+ENV PATH="/home/user/.local/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+        jq \
+        less \
+        procps \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /install /usr/local
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY open_terminal/ open_terminal/
+COPY entrypoint-openshift.sh /app/entrypoint-openshift.sh
+
+RUN pip install --no-cache-dir --no-deps . \
+    && mkdir -p /home/user/.local/bin /home/user/.config /home/user/.local/state /home/user/.cache \
+    && chgrp -R 0 /home/user /app \
+    && chmod -R g=u /home/user /app \
+    && chmod +x /app/entrypoint-openshift.sh
+
+WORKDIR /home/user
+
+EXPOSE 8000
+
+USER 1001
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint-openshift.sh"]
+CMD ["run"]

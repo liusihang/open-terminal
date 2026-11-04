@@ -4,6 +4,286 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.16.1] - 2026-11-04
+
+### Fixed
+
+- Fixed Open Terminal becoming unresponsive when opening a large folder outside a Git repository, such as `/`. Watching that folder for changes no longer scans every subfolder.
+- Added the missing font for emoji and country flags to display correctly in the Browser tab when using the default Docker image.
+
+## [0.16.0] - 2026-11-02
+
+### Added
+
+- You can now hear videos, music, and other app sounds from the Linux Desktop tab. Audio is compressed to keep data use low, and the default Docker image includes the required sound tools. Requires an updated Open WebUI. Sound sharing is not yet available for native Mac or Windows desktops.
+
+### Changed
+
+- Shortened the Browser and Desktop assistant instructions to favor completing known steps together, such as typing and pressing Enter, and checking the result before deciding what to do next.
+
+### Fixed
+
+- Fixed assistants missing a terminal opened before the first chat message. The existing terminal now joins the chat when you send that message, keeping its running programs, output, and settings without restarting the shell. Requires an updated Open WebUI.
+
+## [0.15.5] - 2026-11-02
+
+### Changed
+
+- Docker images now default to `OPEN_TERMINAL_BROWSER_NO_SANDBOX=true` so Chromium can start under Docker's default security restrictions. Chromium's sandbox remains enabled by default outside Docker. Container isolation is unchanged, but Chromium's protection for files and processes inside the container is disabled. Deployments that support Chromium's sandbox can restore it with `OPEN_TERMINAL_BROWSER_NO_SANDBOX=false`.
+
+## [0.15.4] - 2026-11-02
+
+### Changed
+
+- Desktop and Browser now require an actions list for every request, even for a single step. Their tool instructions tell assistants to combine steps such as typing a command and pressing Enter in one call, with one result after the last step. Clients using the old single-action format must update, and cached tool definitions must be refreshed.
+
+## [0.15.3] - 2026-11-02
+
+### Added
+
+- Assistants can now click a desktop field, enter text, and press Enter in one sequence, receiving a screenshot after the last step instead of after each action.
+- Assistants can now fill several fields in the same Browser tab in one sequence, receiving the updated page contents after the last step. Connected apps must support sending actions together to use these Browser and Desktop improvements.
+- Browser and Desktop sequences stop when a step fails and report how many earlier steps completed. Completed steps are not undone, and assistants can still perform one action at a time.
+
+## [0.15.2] - 2026-11-02
+
+### Added
+
+- Added `OPEN_TERMINAL_BROWSER_NO_SANDBOX=true` for deployments where Chromium cannot start with its sandbox enabled. The same setting applies to Browser tabs and Chromium opened from the Linux Desktop in the Docker image. Restart or redeploy Open Terminal after changing it. This setting turns off Chromium's built-in sandbox protection.
+
+### Fixed
+
+- Chrome startup failures on Linux and Mac now show the actual error, such as a locked browser profile or an unavailable sandbox, instead of the generic message asking you to check the installation, user, and sandbox support. The error is also saved in the server logs.
+
+### Security
+
+- Chromium's sandbox now stays enabled by default in Docker. Previously, Open Terminal automatically disabled it when it detected Docker. Existing deployments that cannot run sandboxed Chromium must now explicitly set `OPEN_TERMINAL_BROWSER_NO_SANDBOX=true` to keep launching the browser.
+
+## [0.15.1] - 2026-11-02
+
+### Added
+
+- The Desktop tab can now show and control your Mac or Windows computer when Open Terminal runs directly on it. You and the assistant can use the mouse, type, paste text, and interact with your open applications. It shares the logged-in user's primary screen across workspaces. On Mac, grant Screen Recording and Accessibility permissions to the app running Open Terminal. Requires an updated Open WebUI.
+- Chrome mode in the Browser tab now works on Windows, with automatic detection of installed Chrome, Edge, and Chromium browsers.
+- Browser and Desktop can now be turned off separately with `OPEN_TERMINAL_ENABLE_BROWSER=false` and `OPEN_TERMINAL_ENABLE_DESKTOP=false`. Both remain on by default. Restart Open Terminal after changing either setting.
+
+### Changed
+
+- Browser views on Mac, Windows, and Linux installations without the desktop packages now use less data by skipping unchanged parts of the page and dropping outdated screen updates. Requires an updated Open WebUI.
+
+### Fixed
+
+- Assistants now have controls for your open Browser tabs, addressing requests that previously sent them to Desktop instead. They can see the page, click, scroll, type, and navigate in the existing tab with its current login. They use the selected browser tab, or the last-used tab when the pane is hidden. The tab must be in Chrome mode. Requires an updated Open WebUI.
+- Fixed browser lag after rapid mouse movement and scrolling on Mac, Windows, and Linux installations without the desktop packages. These actions no longer build up a queue that delays typing or navigation.
+
+## [0.15.0] - 2026-11-02
+
+### Added
+
+- Added support for Open WebUI's Browser tab to open websites and apps running inside Open Terminal. Choose Chrome for a full browser or Proxy for a lightweight page preview, with back, forward, reload, and page titles. Requires an updated Open WebUI.
+- Chrome browser tabs support typing, clicking, scrolling, pasting, and mobile page previews. Switching tabs keeps the other pages open. Each user's saved browser profile is reused across tabs and restarts, with automatic recovery from locks left by an interrupted browser. Chrome mode requires Chrome or Chromium on Linux or macOS; Chromium is now included in the default Docker image.
+- Local web app previews now support automatic page updates after you edit their files, along with loading their styles, images, and scripts through Open Terminal. This works with both direct terminal connections and connections through Open WebUI.
+- Added a Desktop tab for opening a Linux desktop in the terminal workspace. You can use graphical apps, including LibreOffice, and reopen the tab without closing running applications. The desktop and its required tools are included in the default Docker image. Requires an updated Open WebUI.
+- Assistants can see screenshots of that same desktop and click, drag, scroll, type text, and press keyboard shortcuts. You and the assistant work with the same open applications and workspace files.
+- Connected apps can now receive file and Git changes as they happen, including edits made from a terminal or another app. They can also update the list of available local web apps when a server starts or stops.
+- Connected apps can show background command output as it arrives and update the command list when commands start or finish. Closing the output viewer leaves the command running.
+- Added support for opening a repository's website from Open WebUI's Git panel and hiding local branch rename and delete actions for remote branches. Requires an updated Open WebUI.
+
+### Fixed
+
+- Added Chinese, Japanese, and Korean fonts to the default Docker image to address blank characters when previewing PDF and Word documents.
+- Git lookup failures now report the error instead of making an existing repository appear to be an ordinary folder.
+- Background commands now publish buffered output even when they stop producing text, and report completion only after their final output has been saved.
+
+## [0.14.8] - 2026-11-01
+
+### Added
+
+- Added support for Open WebUI's Git panel when browsing a Git repository, including its subfolders. The panel can show the current branch, changed files, added and removed lines, and commit history. Requires an updated Open WebUI.
+- From the Git panel, you can select files to commit, review or discard edits, undo the last commit while keeping your files, switch or manage branches, and create separate working folders for other branches. You can also set changes aside and restore them later, download remote changes, and upload your commits.
+- Added GitHub pull request controls for viewing changes, comments, reviews, and checks; creating and editing pull requests; leaving comments and reviews; and merging, closing, or reopening them. These controls require GitHub CLI to be installed and signed in on the machine running Open Terminal.
+
+### Fixed
+
+- When several terminal tabs are open in the same chat, the assistant now reads output and sends input to the active terminal. When no terminal is visible, it uses the last-used terminal that is still connected. Previously, it always used the newest terminal, even after you switched to another tab. Requires an updated Open WebUI.
+
+## [0.14.7] - 2026-10-31
+
+### Added
+
+- File listings now include file and folder creation dates, enabling "Date Added" sorting with an updated Open WebUI. Editing a file does not change its creation date. This includes support in the Alpine Docker image; dates remain unavailable on filesystems that do not provide them.
+
+### Fixed
+
+- Fixed the missing OpenShift Docker image in GitHub Container Registry. Automatic builds and publishing now include `ghcr.io/open-webui/open-terminal:openshift` and versioned OpenShift images for both Intel/AMD and ARM systems. Previously, the OpenShift image was documented but left out of automatic publishing.
+
+## [0.14.6] - 2026-10-29
+
+### Fixed
+
+- Updated the default assistant instructions to present created or edited files through Open WebUI's file viewer before finishing a reply. This addresses replies that showed labels such as "Download PDF" and "Editable Word version" without working download links. Custom assistant instructions must be updated separately to include this guidance.
+
+## [0.14.5] - 2026-10-25
+
+### Added
+
+- `open-terminal run --cftunnel` publishes a temporary Cloudflare HTTPS endpoint with a required configured API key. Reuses installed cloudflared or offers a pinned, checksum-verified download; `--yes` approves unattended downloads. The API and connector shut down together.
+
+### Fixed
+
+- CLI launches using `OPEN_TERMINAL_API_KEY_FILE` no longer leave conflicting API-key environment settings. Explicit `--api-key` overrides environment sources.
+- Malformed REST and terminal WebSocket credentials are rejected without authentication-handler exceptions.
+
+## [0.14.4] - 2026-10-24
+
+### Added
+
+- Optional HTTP keep-alive timeout configuration through `OPEN_TERMINAL_UVICORN_TIMEOUT_KEEP_ALIVE` or `uvicorn_timeout_keep_alive` in TOML. Unset by default, preserving Uvicorn's default behavior.
+
+## [0.14.3] - 2026-10-24
+
+### Fixed
+
+- Fixed Docker startup when outbound network restrictions are enabled. Allowed websites can now be reached, and startup preserves the configured API key, settings, and command arguments. Applies to the default, slim, and Alpine images.
+- Blocked domain names can no longer be looked up by contacting Docker's name lookup service directly, including when all outbound access is disabled.
+- Docker startup now stops if the requested network restrictions cannot be applied, instead of continuing without those restrictions.
+- Commands, interactive terminals, and notebooks no longer automatically receive Open Terminal's API key and server settings. This reduces accidental exposure when programs print their environment settings. Other environment settings and values explicitly supplied for a command are preserved.
+- In multi-user mode, changing folders no longer changes another user's current folder when both users share the same session ID. File operations and commands keep using each user's own selected folder.
+- Changing to a missing folder or a file in multi-user mode now returns an error and keeps the previous folder selected.
+- Connected apps must now identify the user when accessing a workspace in multi-user mode. Requests without a user ID are rejected instead of using the server account's workspace. Single-user mode still works without a user ID.
+- Notebooks now run under the requesting user's account in multi-user mode, with that user's home folder and file permissions. Opening and saving notebooks also follows the same workspace checks as other file operations.
+- Notebook sessions now belong to the user who started them. Other users cannot run cells, view session details, or stop those sessions through the notebook controls.
+
+## [0.14.2] - 2026-10-19
+
+### Fixed
+
+- Reduced memory use when reading and editing large text files. Reading just a few lines no longer loads every line into memory, which could previously crash the server even for a small response.
+- Reduced memory use when reading text from documents, uploading and viewing files, downloading folders as ZIP files, and previewing Word and PowerPoint files as PDFs. Temporary files are removed after sending or cancellation.
+- Reduced memory use when searching large folders or files with many matches, including when loading later pages of results. Matching lines are still returned in full.
+- Reading command output and removing old output from oversized logs no longer loads the entire log into memory. If saving output fails, such as when the disk is full, commands can still finish and release their resources instead of remaining marked as running and retaining memory.
+- Apps opened through forwarded ports now deliver live responses as they arrive. Previously, Open Terminal kept collecting the response in memory until it ended, so continuous updates could fail to appear and keep increasing memory use.
+- Fixed file operations and port checks getting stuck when several commands or terminals were open without producing output on Linux and macOS.
+- Fixed notebook sessions continuing to consume memory after startup failed or execution was cancelled. Shutting down Open Terminal now also stops its commands, terminals, and notebook sessions.
+- Fixed closed terminals leaving connections or programs running in the background, and large inputs to background commands being cut short or mixed together when sent at the same time.
+- Old command logs are now deleted after the configured retention period even when the finished command has already disappeared from the command list. Previously, those logs could remain on disk indefinitely.
+
+## [0.14.1] - 2026-10-16
+
+### Added
+
+- Command results now include the folder the command ran in, so assistants can see where each command started without running a separate command to check.
+
+### Fixed
+
+- Fixed file browsing in Open WebUI when Open Terminal runs directly on Windows. Opening a folder previously failed with a server error while checking whether its files could be edited.
+
+## [0.14.0] - 2026-09-23
+
+### Fixed
+
+- Apps connecting to the MCP server over the network must now provide your Open Terminal API key. Previously, they could run commands and access files without providing the key. Connections with a missing or incorrect key are now rejected. If you had the MCP server enabled for network connections, update to the latest release.
+
+## [0.13.0] - 2026-09-13
+
+### Added
+
+- Assistants in Open WebUI can now use skills installed in your terminal's home folder. Requires Open WebUI 0.11.4.
+- Skills are loaded from the `.agents/skills`, `.cptr/skills`, `.claude/skills`, and `.codex/skills` folders. Skills with the same name appear only once.
+- Assistants can read each skill's instructions and see a list of its supporting files, including scripts and reference documents.
+
+## [0.12.5] - 2026-09-08
+
+### Added
+
+- Connected apps can now compare two files without changing either original. Results include added and removed lines, line numbers, nearby text, and highlights of changed words.
+- File comparison supports plain text, PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB books, and saved email messages. It compares readable text and cell values, with notices explaining which content is left out, such as formatting, images, formulas, and attachments.
+- Comparisons can ignore differences in spaces and tabs. Relative file names are resolved from the current terminal session's folder.
+- Comparisons report encrypted PDFs, PDF pages with no readable text, and EPUB chapters that cannot be read. Files over 50 MiB or text over 2 million characters or 50,000 lines are rejected instead of returning a partial comparison. Comparisons stop after 60 seconds or when the connection closes.
+
+### Fixed
+
+- Reading Word files now keeps paragraphs and tables in their original order instead of moving all tables to the end.
+- Reading Word files now includes tracked insertions and excludes tracked deletions, including deleted table rows and cells. Moved text appears in its new location, and deleting a paragraph break joins the surrounding text. The original file is unchanged.
+
+### Changed
+
+- Added automatic publishing to PyPI when a new version reaches the main branch. Versions already available on PyPI are skipped.
+
+## [0.12.4] - 2026-09-06
+
+### Added
+
+- Assistants can now read recent output and send text to your connected terminal in the current chat, including answering prompts from a running program. Requires Open WebUI 0.11.4.
+
+### Fixed
+
+- Terminal and background command lists now show only entries belonging to the current user and chat. Other users and chats cannot read their output, send them input, or stop them through these controls.
+- Opening another terminal in the same chat no longer replaces the first terminal's saved entry.
+- A second connection to an already connected terminal is now rejected, preventing the two connections from splitting its output.
+- Sending a large amount of text to a busy terminal no longer drops the unwritten portion. Text sent at the same time is handled in order without mixing the requests together.
+- Stopped background commands remain available for five minutes so you can check their output and exit code. They stay marked as killed instead of changing to done.
+- Checking for new command output after reading only the latest lines no longer repeats older output. Checks also keep their place when an oversized log has its oldest output removed, and report when output was discarded.
+- Reading command output while an oversized log is being shortened no longer returns a partially rewritten log. Commands are marked done only after their final output has been saved, including when the log was shortened during the run.
+
+## [0.12.3] - 2026-08-27
+
+### Added
+
+- Word and PowerPoint files can now open as PDF previews from the file viewer when preview mode is requested. If a preview cannot be made, Open Terminal still returns the original file.
+- The default Docker image now includes the PDF tools needed for previews and PDF file work, so users do not have to install them separately.
+- The README now explains how to use external workspace storage and how Office file previews behave.
+
+## [0.12.2] - 2026-08-25
+
+### Fixed
+
+- Opening a forwarded port now only works for ports that belong to your own visible terminal session. Requests for other local ports are blocked with "Port not found" instead of being forwarded.
+
+## [0.12.1] - 2026-08-22
+
+### Fixed
+
+- Added headless LibreOffice and Office-compatible fonts to the default Docker image so agents can convert Word, Excel, and PowerPoint files to PDF without installing extra system packages. The slim, alpine, and openshift images remain minimal.
+
+## [0.12.0] - 2026-08-22
+
+### Added
+
+- Apps can now search terminal workspace files by file name and file contents in one file browser search.
+- Search results show file name matches first, followed by files that match inside their contents.
+- Content results include matching line previews so users can jump to the relevant place in a file.
+- File browser search follows the current terminal session folder, so users search the same workspace their terminal is using.
+- File browser search respects `.gitignore` and the app's hidden-file setting.
+- Large search result sets can now load more results without restarting the search.
+
+## [0.11.36] - 2026-08-22
+
+### Added
+
+- Added file search for apps that need to let users pick files from the active terminal workspace.
+- File search now follows the current terminal session folder, so results come from the same place the terminal is working in.
+- File search respects `.gitignore`, so ignored folders and files do not appear in picker results.
+- File search can include hidden dotfiles when the connected app asks to show them.
+
+### Fixed
+
+- Every file search result now includes the file name, full path, whether it is a file or folder, file size, and last modified time.
+
+## [0.11.35] - 2026-08-09
+
+### Added
+
+- Added an OpenShift image for restricted non-root clusters. It runs without root, blocks unsupported runtime package installs, and clearly reports when multi-user mode is requested.
+- Added file browser root metadata so clients can show a friendly starting point and hide parent navigation above it.
+- Added `OPEN_TERMINAL_FILE_BROWSER_ROOT` so operators can choose Home, a specific workspace path, a path under Home, or no visual root.
+- Added writable status to file and folder listings so clients can disable save, upload, rename, and delete actions before users hit a permission error.
+- Added template variables for custom system prompts, including operating system, host name, user, shell, Python version, and Home path.
+
+### Fixed
+
+- Fixed the MCP server connection when Open Terminal is protected by an API key. MCP requests now include the configured bearer token.
+
 ## [0.11.34] - 2026-04-08
 
 ### Added

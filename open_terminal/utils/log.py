@@ -1,42 +1,62 @@
-"""Process log management utilities.
+"""Bounded process logs, cursor reads, and failure-safe process finalization."""
 
-Handles writing, reading, and capping JSONL log files for background
-processes.  Extracted from ``main.py`` to keep the route module focused.
-"""
-
+import asyncio
+from collections import deque
 import json
+import logging
 import os
+import shutil
 import time
+import tempfile
 from typing import Optional
 
 import aiofiles
 import aiofiles.os
 
 from open_terminal.env import MAX_PROCESS_LOG_SIZE, LOG_FLUSH_INTERVAL, LOG_FLUSH_BUFFER
+from open_terminal.utils.limits import CHUNK_SIZE, run_io
+
+log = logging.getLogger(__name__)
+
+
+def _records(stream):
+    for line in stream:
+        try:
+            yield json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+
+
+def _rotate_log(path: str) -> int:
+    temporary = path + ".rotating"
+    try:
+        with open(path, "rb") as source:
+            split = sum(1 for _ in source) // 2
+            source.seek(0)
+            offset = 0
+            for _ in range(split):
+                record = json.loads(source.readline())
+                if record.get("type") == "log_rotated":
+                    offset = record.get("offset", 0)
+                elif record.get("type") in ("stdout", "stderr", "output"):
+                    offset += 1
+            kept_size = os.fstat(source.fileno()).st_size - source.tell()
+            with open(temporary, "wb") as target:
+                target.write((json.dumps({"type": "log_rotated", "offset": offset, "ts": time.time()}) + "\n").encode())
+                shutil.copyfileobj(source, target, CHUNK_SIZE)
+        os.replace(temporary, path)
+        return kept_size
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 class BoundedLogWriter:
-    """Async wrapper that rotates the log file when it exceeds a size limit.
+    """Rotate on disk; disable logging on I/O failure while draining the child."""
 
-    When the total bytes written surpass *MAX_PROCESS_LOG_SIZE*, the file
-    is truncated to its newest half and a ``log_rotated`` marker is inserted.
-    Writing then continues, so the most recent output is always available.
-
-    Flushing behaviour is controlled by *flush_interval* and *flush_buffer*:
-
-    * ``flush_interval=0`` (default) — flush after every write (original
-      behaviour, safest for low-throughput commands).
-    * ``flush_interval>0`` — flush at most once per *flush_interval* seconds,
-      **or** when the unflushed buffer exceeds *flush_buffer* bytes (if set).
-      This dramatically reduces I/O pressure for high-output commands.
-    """
-
-    __slots__ = (
-        "_file", "_log_path", "_bytes_written", "rotated",
-        "_flush_interval", "_flush_buffer", "_unflushed", "_last_flush",
-    )
-
-    def __init__(self, file, log_path: str, *, flush_interval: float = 0, flush_buffer: int = 0):
+    def __init__(self, file, log_path: str, *, flush_interval: float = 0, flush_buffer: int = 0, on_flush=None):
         self._file = file
         self._log_path = log_path
         self._bytes_written = 0
@@ -45,221 +65,244 @@ class BoundedLogWriter:
         self._flush_buffer = flush_buffer
         self._unflushed = 0
         self._last_flush = time.monotonic()
+        self._lock = asyncio.Lock()
+        self._on_flush = on_flush
+        self._flush_task = None
+
+    async def _disable(self, exc):
+        log.warning("Disabling process log %s: %s", self._log_path, exc)
+        await self.close()
 
     async def write(self, data: str) -> None:
-        encoded_len = len(data.encode("utf-8", errors="replace"))
-        if self._bytes_written + encoded_len > MAX_PROCESS_LOG_SIZE:
-            await self._rotate()
-        await self._file.write(data)
-        self._bytes_written += encoded_len
-        self._unflushed += encoded_len
-
-        if self._flush_interval <= 0:
-            # Legacy behaviour: flush on every write.
-            await self._file.flush()
-            self._unflushed = 0
-            return
-
-        now = time.monotonic()
-        should_flush = (now - self._last_flush) >= self._flush_interval
-        if not should_flush and self._flush_buffer > 0:
-            should_flush = self._unflushed >= self._flush_buffer
-        if should_flush:
-            await self._file.flush()
-            self._unflushed = 0
-            self._last_flush = now
+        async with self._lock:
+            if self._file is None:
+                return
+            try:
+                size = len(data.encode("utf-8", errors="replace"))
+                if self._bytes_written + size > MAX_PROCESS_LOG_SIZE:
+                    await self._rotate()
+                await self._file.write(data)
+                self._bytes_written += size
+                self._unflushed += size
+                if (self._flush_interval <= 0
+                    or time.monotonic() - self._last_flush >= self._flush_interval
+                    or self._flush_buffer > 0 and self._unflushed >= self._flush_buffer):
+                    await self.flush()
+                elif self._flush_task is None:
+                    self._flush_task = asyncio.create_task(self._flush_pending())
+            except (OSError, ValueError) as exc:
+                await self._disable(exc)
 
     async def flush(self) -> None:
-        await self._file.flush()
-        self._unflushed = 0
-        self._last_flush = time.monotonic()
-
-    async def _rotate(self) -> None:
-        """Keep the newest half of the log file and continue writing."""
-        self.rotated = True
-        await self._file.flush()
-        # Close, rewrite, and reopen.
-        await self._file.close()
-
-        async with aiofiles.open(self._log_path, "r", encoding="utf-8") as f:
-            lines = await f.readlines()
-
-        # Keep the newest half of output lines.
-        keep = lines[len(lines) // 2 :]
-
-        async with aiofiles.open(self._log_path, "w", encoding="utf-8") as f:
-            await f.write(
-                json.dumps({"type": "log_rotated", "ts": time.time()}) + "\n"
-            )
-            for line in keep:
-                await f.write(line)
-
-        # Reopen in append mode and reset byte counter.
-        self._file = await aiofiles.open(self._log_path, "a", encoding="utf-8")
-        self._bytes_written = sum(len(l.encode("utf-8", errors="replace")) for l in keep)
-
-
-async def tail_log(log_path: str, n: int) -> list[dict]:
-    """Read the last *n* output entries from a JSONL log without loading the whole file.
-
-    Uses a reverse-read strategy: read chunks from the end of the file
-    until enough newline-delimited records have been collected.
-    """
-    CHUNK = 8192
-    entries: list[dict] = []
-
-    async with aiofiles.open(log_path, "rb") as f:
-        await f.seek(0, 2)  # seek to end
-        remaining = await f.tell()
-        buffer = b""
-
-        while remaining > 0 and len(entries) < n:
-            read_size = min(CHUNK, remaining)
-            remaining -= read_size
-            await f.seek(remaining)
-            chunk = await f.read(read_size)
-            buffer = chunk + buffer
-            lines = buffer.split(b"\n")
-            # The first element may be a partial line — keep it for next iteration.
-            buffer = lines[0]
-            for raw_line in reversed(lines[1:]):
-                raw_line = raw_line.strip()
-                if not raw_line:
-                    continue
-                try:
-                    record = json.loads(raw_line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-                if record.get("type") in ("stdout", "stderr", "output"):
-                    entries.append({"type": record["type"], "data": record["data"]})
-                    if len(entries) >= n:
-                        break
-
-        # Process any remaining buffer content.
-        if buffer.strip() and len(entries) < n:
+        task, self._flush_task = self._flush_task, None
+        if task and task is not asyncio.current_task():
+            task.cancel()
+        if self._file is not None:
             try:
-                record = json.loads(buffer)
-                if record.get("type") in ("stdout", "stderr", "output"):
-                    entries.append({"type": record["type"], "data": record["data"]})
-            except (json.JSONDecodeError, UnicodeDecodeError):
+                await self._file.flush()
+                self._unflushed = 0
+                self._last_flush = time.monotonic()
+                if self._on_flush:
+                    self._on_flush()
+            except (OSError, ValueError) as exc:
+                await self._disable(exc)
+
+    async def close(self):
+        if self._flush_task:
+            self._flush_task.cancel()
+            self._flush_task = None
+        file, self._file = self._file, None
+        if file is not None:
+            try:
+                await file.close()
+            except (OSError, ValueError):
                 pass
 
-    entries.reverse()  # restore chronological order
-    return entries[-n:]
+    async def _flush_pending(self):
+        # A quiet command still needs to publish its last buffered chunk.
+        await asyncio.sleep(self._flush_interval)
+        async with self._lock:
+            await self.flush()
+
+    async def _rotate(self):
+        await self._file.flush()
+        await self._file.close()
+        self._file = None
+        self._bytes_written = await run_io(_rotate_log, self._log_path)
+        self._file = await aiofiles.open(self._log_path, "a", encoding="utf-8")
+        self.rotated = True
 
 
-async def log_process(background_process) -> None:
-    """Read process output and persist to a log file.
-
-    When the file exceeds *MAX_PROCESS_LOG_SIZE*, the oldest half is
-    discarded so the most recent output is always available.
-    """
-    log_file = None
-    log_rotated = False
+async def log_process(background_process, on_finish=None) -> None:
+    writer = None
+    runner = background_process.runner
     try:
         if background_process.log_path:
-            await aiofiles.os.makedirs(
-                os.path.dirname(background_process.log_path), exist_ok=True
-            )
-            log_file = await aiofiles.open(background_process.log_path, "a", encoding="utf-8")
-            await log_file.write(
-                json.dumps(
-                    {
-                        "type": "start",
-                        "command": background_process.command,
-                        "pid": background_process.runner.pid,
-                        "ts": time.time(),
-                    }
-                )
-                + "\n"
-            )
-            await log_file.flush()
-    except OSError:
-        log_file = None
-
-    # Wrap the log file so it rotates when the size limit is reached.
-    writer = (
-        BoundedLogWriter(
-            log_file,
-            background_process.log_path,
-            flush_interval=LOG_FLUSH_INTERVAL,
-            flush_buffer=LOG_FLUSH_BUFFER,
-        )
-        if log_file
-        else None
-    )
-
-    try:
-        await background_process.runner.read_output(writer)
+            try:
+                await aiofiles.os.makedirs(os.path.dirname(background_process.log_path), exist_ok=True)
+                file = await aiofiles.open(background_process.log_path, "a", encoding="utf-8")
+                writer = BoundedLogWriter(file, background_process.log_path,
+                    flush_interval=LOG_FLUSH_INTERVAL, flush_buffer=LOG_FLUSH_BUFFER,
+                    on_flush=background_process.notify_output)
+                await file.write(json.dumps({"type": "start", "command": background_process.command, "pid": runner.pid, "ts": time.time()}) + "\n")
+                await writer.flush()
+            except OSError as exc:
+                log.warning("Cannot open process log: %s", exc)
+        await runner.read_output(writer)
+        background_process.exit_code = await runner.wait()
+    except asyncio.CancelledError:
+        background_process.status = "killed"
+        runner.kill(force=True)
+        raise
+    except Exception as exc:
+        runner.kill(force=True)
+        log.warning("Command %s failed: %s", background_process.id, exc)
     finally:
-        log_rotated = writer.rotated if writer else False
-        exit_code = await background_process.runner.wait()
-        background_process.exit_code = exit_code
-        background_process.status = "done"
-        background_process.finished_at = time.time()
-        background_process.runner.close()
-        if writer:
-            # Flush any buffered output before writing the end marker.
-            await writer.flush()
-        if log_file:
-            await log_file.write(
-                json.dumps(
-                    {
-                        "type": "end",
-                        "exit_code": background_process.exit_code,
-                        "log_rotated": log_rotated,
-                        "ts": time.time(),
-                    }
-                )
-                + "\n"
-            )
-            await log_file.close()
-
-
-async def read_log(
-    log_path: Optional[str],
-    offset: int = 0,
-    tail: Optional[int] = None,
-) -> tuple[list[dict], int, bool]:
-    """Read output entries from a JSONL log file.
-
-    Returns ``(entries, next_offset, truncated)``.
-
-    When *tail* is specified and *offset* is 0, the file is read from the
-    end to avoid loading the entire file into memory — preventing the
-    memory spike that caused the OOM issue.
-    """
-    entries: list[dict] = []
-    if not log_path or not await aiofiles.os.path.isfile(log_path):
-        return entries, 0, False
-
-    # --- Optimised tail-from-end path ---
-    if tail is not None and offset == 0:
-        tail_entries = await tail_log(log_path, tail)
-        truncated = len(tail_entries) == tail  # may have been more
-        return tail_entries, len(tail_entries), truncated
-
-    # --- Full scan path (bounded by offset) ---
-    async with aiofiles.open(log_path, encoding="utf-8") as f:
-        lines = await f.readlines()
-
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
         try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if record.get("type") in ("stdout", "stderr", "output"):
-            entries.append({"type": record["type"], "data": record["data"]})
+            background_process.exit_code = await runner.wait()
+        finally:
+            runner.close()
+            if background_process.status == "running":
+                background_process.status = "done"
+            if writer:
+                try:
+                    await writer.write(json.dumps({"type": "end", "exit_code": background_process.exit_code, "log_rotated": writer.rotated, "ts": time.time()}) + "\n")
+                    await writer.flush()
+                finally:
+                    await writer.close()
+            background_process.finished_at = time.time()
+            background_process.notify_output()
+            if on_finish:
+                on_finish()
 
-    total = len(entries)
-    entries = entries[offset:]
 
-    truncated = False
-    if tail is not None and len(entries) > tail:
-        entries = entries[-tail:]
-        truncated = True
+class LogReader:
+    """Keep a byte position for live reads; retain absolute cursors across rotation."""
 
-    return entries, total, truncated
+    def __init__(self, path, offset=0, tail=None):
+        self.path = path
+        self.offset = offset
+        self.tail = tail
+        self.identity = None
+        self.position = 0
+        self.total = 0
+
+    def _read(self):
+        selected = deque(maxlen=self.tail)
+        available = 0
+        truncated = False
+        try:
+            source = open(self.path, "rb") if self.path else None
+        except FileNotFoundError:
+            source = None
+        if source is None:
+            return [], self.offset, False
+        with source:
+            stat = os.fstat(source.fileno())
+            identity = (stat.st_dev, stat.st_ino)
+            if identity != self.identity or stat.st_size < self.position:
+                self.position = self.total = 0
+            source.seek(self.position)
+            while True:
+                position = source.tell()
+                line = source.readline()
+                if not line or not line.endswith(b"\n"):
+                    # A concurrent writer may not have finished its last record yet.
+                    self.position = position
+                    break
+                try:
+                    record = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                kind = record.get("type")
+                if kind == "log_rotated":
+                    self.total = record.get("offset", 0)
+                    truncated = self.offset < self.total
+                elif kind in ("stdout", "stderr", "output"):
+                    if self.total >= self.offset:
+                        selected.append({"type": kind, "data": record["data"]})
+                        available += 1
+                    self.total += 1
+            self.identity = identity
+            self.offset = self.total
+        return list(selected), self.offset, truncated or available > len(selected)
+
+    async def read(self):
+        return await run_io(self._read)
+
+
+async def read_log(log_path: Optional[str], offset: int = 0, tail: Optional[int] = None) -> tuple[list[dict], int, bool]:
+    return await LogReader(log_path, offset, tail).read()
+
+
+def _build_log_response(path, metadata, offset, tail):
+    """Serialize complete output to disk without retaining a list of all entries."""
+    from open_terminal.utils.fs import TemporaryFileResponse
+
+    fd, temporary = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(json.dumps(metadata, ensure_ascii=False)[:-1] + ',"output":[')
+            total = available = 0
+            truncated = False
+            try:
+                source = open(path, "rb") if path else None
+            except FileNotFoundError:
+                source = None
+            if source is not None:
+                with source:
+                    # Hold this generation's descriptor across both passes. A
+                    # rotation replaces the pathname but cannot change our data.
+                    end = os.fstat(source.fileno()).st_size
+                    def records():
+                        while source.tell() < end:
+                            line = source.readline(end - source.tell())
+                            try:
+                                yield json.loads(line)
+                            except (ValueError, UnicodeError):
+                                continue
+                    for record in records():
+                        kind = record.get("type")
+                        if kind == "log_rotated":
+                            total = record.get("offset", 0)
+                            truncated = offset < total
+                        elif kind in ("stdout", "stderr", "output"):
+                            available += total >= offset
+                            total += 1
+                    skip = max(0, available - tail) if tail is not None else 0
+                    truncated |= skip > 0
+                    source.seek(0)
+                    index = 0
+                    separator = ""
+                    for record in records():
+                        kind = record.get("type")
+                        if kind == "log_rotated":
+                            index = record.get("offset", 0)
+                        elif kind in ("stdout", "stderr", "output"):
+                            if index >= offset:
+                                if skip:
+                                    skip -= 1
+                                else:
+                                    output.write(separator)
+                                    json.dump({"type": kind, "data": record["data"]}, output, ensure_ascii=False)
+                                    separator = ","
+                            index += 1
+            output.write('],"next_offset":' + str(total) + ',"truncated":' + json.dumps(truncated) + '}')
+        return TemporaryFileResponse(temporary, media_type="application/json")
+    except BaseException:
+        os.unlink(temporary)
+        raise
+
+
+async def log_response(path, metadata, offset=0, tail=None):
+    task = asyncio.create_task(asyncio.to_thread(_build_log_response, path, metadata, offset, tail))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            response = await task
+        except Exception:
+            pass
+        else:
+            os.unlink(response.path)
+        raise

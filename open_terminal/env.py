@@ -3,6 +3,14 @@ import os
 from open_terminal import config
 
 
+def sanitized_environ(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Exclude inherited server settings; explicit command overrides still win."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("OPEN_TERMINAL_")}
+    if extra:
+        env.update(extra)
+    return env
+
+
 def _resolve_file_env(var: str, default: str = "") -> str:
     """Resolve an environment variable with Docker-secrets ``_FILE`` support.
 
@@ -90,7 +98,7 @@ EXECUTE_DESCRIPTION = os.environ.get(
 )
 
 # Maximum size (in bytes) for per-process JSONL log files.
-# Once exceeded, logging stops for that process (the process keeps running).
+# Once exceeded, the oldest portion is removed on disk; output capture continues.
 MAX_PROCESS_LOG_SIZE = int(
     os.environ.get(
         "OPEN_TERMINAL_MAX_LOG_SIZE",
@@ -99,7 +107,7 @@ MAX_PROCESS_LOG_SIZE = int(
 )
 
 # How long (in seconds) to keep finished-process log files on disk.
-# After this period, _cleanup_expired() will delete the log file.
+# A periodic disk sweep removes expired logs independently of process records.
 PROCESS_LOG_RETENTION: float = float(
     os.environ.get(
         "OPEN_TERMINAL_LOG_RETENTION",
@@ -131,6 +139,20 @@ ENABLE_NOTEBOOKS = os.environ.get(
     str(config.get("enable_notebooks", True)),
 ).lower() not in ("false", "0", "no")
 
+ENABLE_BROWSER = os.environ.get(
+    "OPEN_TERMINAL_ENABLE_BROWSER",
+    str(config.get("enable_browser", True)),
+).lower() not in ("false", "0", "no")
+
+BROWSER_NO_SANDBOX = os.environ.get(
+    "OPEN_TERMINAL_BROWSER_NO_SANDBOX", "false"
+).lower() in ("true", "1", "yes")
+
+ENABLE_DESKTOP = os.environ.get(
+    "OPEN_TERMINAL_ENABLE_DESKTOP",
+    str(config.get("enable_desktop", True)),
+).lower() not in ("false", "0", "no")
+
 ENABLE_SYSTEM_PROMPT = os.environ.get(
     "OPEN_TERMINAL_ENABLE_SYSTEM_PROMPT",
     str(config.get("enable_system_prompt", True)),
@@ -156,10 +178,23 @@ UVICORN_LOOP = os.environ.get(
     config.get("uvicorn_loop", "auto"),
 )
 
+UVICORN_TIMEOUT_KEEP_ALIVE: float | None = None
+_uvicorn_timeout_keep_alive = os.environ.get(
+    "OPEN_TERMINAL_UVICORN_TIMEOUT_KEEP_ALIVE",
+    config.get("uvicorn_timeout_keep_alive"),
+)
+if _uvicorn_timeout_keep_alive is not None:
+    UVICORN_TIMEOUT_KEEP_ALIVE = float(_uvicorn_timeout_keep_alive)
+
 OPEN_TERMINAL_INFO = os.environ.get(
     "OPEN_TERMINAL_INFO",
     config.get("info", ""),
 )
+
+FILE_BROWSER_ROOT = os.environ.get(
+    "OPEN_TERMINAL_FILE_BROWSER_ROOT",
+    config.get("file_browser_root", "home"),
+).strip()
 
 # How long (in seconds) to keep per-session cwd entries in memory.
 # Sliding window — refreshed on every access.
@@ -169,5 +204,3 @@ SESSION_CWD_TTL: float = float(
         config.get("session_cwd_ttl", 604_800),  # 7 days
     )
 )
-
-

@@ -42,21 +42,24 @@ def _parameter_description(operation: dict, name: str) -> str:
     return ""
 
 
-def test_openapi_exposes_only_core_model_tools():
-    client = _client()
+CORE_MODEL_TOOLS = {
+    "get_environment", "run_command", "get_process_status", "list_processes",
+    "send_process_input", "kill_process", "read_file", "write_file",
+    "apply_patch", "display_file",
+}
 
-    assert _operation_ids(client) == {
-        "get_environment",
-        "run_command",
-        "get_process_status",
-        "list_processes",
-        "send_process_input",
-        "kill_process",
-        "read_file",
-        "write_file",
-        "apply_patch",
-        "display_file",
-    }
+
+def test_openapi_preserves_core_and_new_upstream_tools():
+    from open_terminal import main
+
+    expected = CORE_MODEL_TOOLS | {"match_files", "search_files"}
+    if main.ENABLE_TERMINAL:
+        expected |= {"read_user_terminal", "send_user_terminal_input"}
+    if main.ENABLE_BROWSER:
+        expected |= {"browser_tabs", "browser_snapshot", "browser_screenshot", "browser_action"}
+    if main.ENABLE_DESKTOP and main.desktop_available():
+        expected |= {"desktop_screenshot", "desktop_action"}
+    assert _operation_ids(_client()) == expected
 
 
 def test_model_visible_tool_descriptions_are_explicit():
@@ -64,8 +67,8 @@ def test_model_visible_tool_descriptions_are_explicit():
     schema = client.get("/openapi.json").json()
     operations = _operations_by_id(client)
 
-    for operation in operations.values():
-        description = operation["description"]
+    for tool in CORE_MODEL_TOOLS:
+        description = operations[tool]["description"]
         assert "Use when:" in description
         assert "Inputs:" in description
         assert "Returns:" in description
