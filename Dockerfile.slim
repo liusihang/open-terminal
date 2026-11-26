@@ -2,9 +2,8 @@
 #  Open Terminal — Slim Image (Debian)
 # ============================================================================
 #
-#  A minimal, hardened image for running the Open Terminal API.
+#  A minimal, hardened image for Open Terminal with git, curl, jq, and the egress firewall.
 #  No Node.js, no Docker CLI, no data-science libraries, no sudo.
-#  Just the terminal API, git, curl, and the egress firewall.
 #
 #  Build:
 #    docker build -f Dockerfile.slim -t open-terminal:slim .
@@ -25,7 +24,7 @@
 #  Compiles Python dependencies in an isolated prefix so we can copy only
 #  the final result into the slim runtime image — no compilers shipped.
 # --------------------------------------------------------------------------
-FROM python:3.12.13-slim AS builder
+FROM python:3.12.16-slim AS builder
 
 WORKDIR /src
 
@@ -51,7 +50,7 @@ RUN pip install --no-cache-dir --prefix=/install .
 #  Stage 2: Runtime
 #  The actual image that ships. No compilers, no build tools, no sudo.
 # --------------------------------------------------------------------------
-FROM python:3.12.13-slim
+FROM python:3.12.16-slim
 
 # ── Runtime system packages ────────────────────────────────────────────────
 #

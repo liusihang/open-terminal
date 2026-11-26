@@ -4,6 +4,353 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.18.6] - 2026-11-26
+
+### Fixed
+
+- Fixed pasted Korean text, accented letters, and emoji being dropped on shared Wayland desktops by using the remote clipboard when access is allowed. Existing GNOME sharing approvals may need to be renewed with clipboard access enabled; see the [setup instructions](docs/configuration.md#desktop). Without that permission, these characters may still be dropped. Pasting this text replaces the remote clipboard's contents.
+- Added support for Ctrl+Shift+V, or Cmd+Shift+V from a Mac, when pasting into terminals inside the desktop viewer. This lets terminals receive clipboard text instead of treating Ctrl+V as a different command. Requires an updated Open WebUI.
+
+## [0.18.5] - 2026-11-26
+
+### Fixed
+
+- Fixed mouse movement and clicks being ignored outside the top-left quarter of shared GNOME Wayland desktops at 200% display scaling. The mouse can now reach the full screen, including buttons near the right and bottom edges. This corrects the incomplete scaling fix in 0.18.3 and applies to both the desktop viewer and assistant actions.
+
+## [0.18.4] - 2026-11-26
+
+### Changed
+
+- Desktop views that do not use VNC now send separate updates for changed screen areas, so typing or a ticking clock does not resend the space between them. Text sharpens after movement stops. Picture quality drops when the connection cannot keep up and rises again when it recovers.
+- Video playback, scrolling, and moving windows can now use video compression to reduce bandwidth in those desktop views. Requires an updated Open WebUI, HTTPS or localhost, and FFmpeg with libx264. Sharing automatically falls back to still-image updates if video compression is unavailable or fails. See the [setup instructions](docs/configuration.md#desktop).
+- Shared GNOME Wayland desktops now show a sharper picture on displays using scaling, up to 1920 by 1080. The viewer can update up to 60 times per second when the connection keeps up.
+- Trackpad scrolling now follows the size of your gesture instead of treating every small movement as a full mouse-wheel step. Both vertical and horizontal scrolling are supported. Requires an updated Open WebUI.
+
+### Fixed
+
+- Mouse and keyboard input no longer waits for screen capture and image preparation to finish.
+- Fixed desktop sharing reconnecting after an invalid input message, an oversized paste, or a failed mouse or keyboard action. The failed action is skipped while sharing continues. Rapid scrolling is combined into fewer updates to avoid filling the input queue.
+- Removed the second, trailing mouse pointer from shared Wayland desktops. The viewer shows one pointer; assistant screenshots no longer include the host pointer.
+
+## [0.18.3] - 2026-11-26
+
+### Fixed
+
+- Fixed the mouse reaching only the top-left quarter of a shared GNOME Wayland desktop at 200% display scaling. Mouse movement, clicks, and dragging now account for the shared monitor's display scale, including fractional settings such as 125%. This applies to both the desktop viewer and assistant actions. Restart desktop sharing if you change the display scale while connected.
+
+## [0.18.2] - 2026-11-25
+
+### Fixed
+
+- Fixed clicks, drag releases, and scrolling landing at the previous mouse position when controlling a Mac's desktop. This applies to both the desktop viewer and assistant actions.
+- Fixed users losing access to their saved home folders after recreating a multi-user container, including when users reconnect in a different order. Existing folders are matched back to their owners, and interrupted repairs are retried on the next access.
+- Fixed the file browser refusing to list, read, upload, or overwrite files in multi-user home folders on NFS network storage, even when the same files worked in the terminal. Existing folders may take longer to open on first access while ownership is repaired; the storage server must allow those repairs.
+
+## [0.18.1] - 2026-11-25
+
+### Fixed
+
+- Fixed coding-agent chats refusing new messages with "Another agent turn is running in this conversation" for up to an hour after Open WebUI crashes. Once the old agent has been disconnected for at least 10 seconds, sending a new message stops it and starts a new turn. The interrupted reply does not resume automatically; file changes already made by the agent remain.
+- Pull requests now include unresolved comments left on lines of code, with their file and line, so they appear in Activity and reach the agent when you use Address feedback. Comments on code that has since changed show only their file. Requires an updated Open WebUI.
+
+## [0.18.0] - 2026-11-24
+
+### Added
+
+- The assistant in a folder workspace can now read and type in your workspace terminals and view or control your workspace browser tabs from its chats. Terminals and browser tabs remain tied to your user account. Requires an updated Open WebUI.
+- Workspace chats can now find and read skills saved in the project directory, including `.agents/skills`, `.claude/skills`, `.codex/skills`, and `.cptr/skills`. If a project skill has the same name as one in your home directory, the project version takes precedence. Requires an updated Open WebUI.
+
+### Changed
+
+- Updated the remaining package and Docker image descriptions to reflect Open Terminal's role as a remote machine API.
+
+## [0.17.23] - 2026-11-24
+
+### Added
+
+- You can now open the same terminal in multiple windows or devices within the same user account and chat. Each viewer sees the output and can type. The terminal size follows whichever viewer last typed or resized it. A slow viewer can skip older output without holding up the others.
+
+### Changed
+
+- Terminal shells no longer stop five minutes after you disconnect. Builds, development servers, and other programs started in the terminal keep running when you close the browser or lose your connection. Return to the same chat to reconnect. Closing the terminal itself, exiting the shell, or stopping Open Terminal still ends the session.
+- Removed the default limit of 16 terminal shells per server. Administrators can still set a limit with `OPEN_TERMINAL_MAX_SESSIONS`; leave it unset or empty for no limit. Existing numeric limits still apply, and `0` allows no shells.
+
+## [0.17.22] - 2026-11-22
+
+### Added
+
+- Added `open-terminal install-deps` to install the programs needed for the XFCE desktop, desktop sound, and Chrome tabs on Debian and Ubuntu. Add `desktop` or `browser` to install just one. It skips packages already installed and asks before installing; administrator access is required. Restart Open Terminal afterwards. Debian uses Chromium; Ubuntu uses Google Chrome, with automatic browser installation available only on x86-64 machines.
+- Use `open-terminal install-deps --dry-run` to preview the installation command, or `--yes` to skip confirmation in scripts. You can also install extra programs, for example `open-terminal install-deps --package libreoffice`. See the [setup instructions](docs/configuration.md#desktop).
+
+## [0.17.21] - 2026-11-21
+
+### Added
+
+- Added support for continuing Claude Code chats from an earlier reply when you regenerate a response or edit a previous message. Forked chats can continue in a separate copy of the Claude conversation. Requires an updated Open WebUI. Going back in a chat does not undo changes to files.
+- Added the `open-machine` alias package. Install it to use `open-machine` with the same commands and options as `open-terminal`.
+- Added `open-terminal bridge <socket>` so clients can connect over SSH even when the remote machine blocks socket forwarding. It connects to an already running `--ipc` server on Linux or macOS, without opening a network port. See the [SSH connection instructions](README.md#private-local-ipc).
+
+### Changed
+
+- Help, version checks, and the new bridge command start faster.
+
+## [0.17.20] - 2026-11-16
+
+### Added
+
+- File edits made by the assistant can now show the added and removed lines, with line numbers, in chat. This also works when the assistant saves over an existing text file. Requires an updated Open WebUI. Full rewrites may show the replacement text instead of a line-by-line comparison.
+
+### Fixed
+
+- Fixed new uploads becoming unreadable in multi-user setups, causing file reads, previews, and later edits to fail with permission errors. Files uploaded before this update may still need their permissions repaired.
+
+## [0.17.19] - 2026-11-16
+
+### Added
+
+- Added Hermes, Antigravity, GitHub Copilot, Goose, and Qwen Code as coding agents you can use in Open WebUI chats. Install each agent and set up its login or model provider as the user running Open Terminal. Requires an updated Open WebUI.
+- You can now add other ACP-compatible coding agents, such as Factory Droid or Kiro, without changing Open Terminal's code. Set their names and launch commands in `OPEN_TERMINAL_ACP_AGENTS`, then restart Open Terminal; see the [agent setup instructions](README.md#coding-agents-in-chat). Requires an updated Open WebUI and agents that are already installed and set up. Choosing Auto still asks for approval unless Open WebUI has a separate approval reviewer configured.
+- Choosing Auto for tool approvals in Open WebUI now lets Claude Code and Grok review and approve routine actions themselves. Actions they send back for approval still go through Open WebUI's approval checks. Requires an updated Open WebUI and agent versions that support Auto mode.
+
+## [0.17.18] - 2026-11-16
+
+### Fixed
+
+- Fixed dragging windows and selecting text on Mac desktops, both in the desktop viewer and when asking the assistant to drag.
+- Reduced desktop viewer lag during rapid mouse movement, especially on Mac. The viewer follows your latest pointer position instead of replaying every movement, while keeping clicks, typing, and scrolling in order. Screen updates no longer wait for all pending mouse movements to finish.
+
+## [0.17.17] - 2026-11-15
+
+### Fixed
+
+- Prevented XFCE's `xiccd` color service from starting automatically in virtual desktops, avoiding unnecessary color-profile authentication prompts. Host color management and application-requested keyring unlocks are unchanged.
+
+## [0.17.16] - 2026-11-15
+
+### Fixed
+
+- Virtual XFCE sessions now use XFCE session settings and prefer XFCE Terminal over Ubuntu's systemd-dependent default terminal. Session-local startup overrides disable selected host network, power, GNOME color, and login-keyring autostart entries, without changing host settings or authentication policy.
+- Multi-user commands now retain their explicit desktop and audio environment after switching users, allowing API-launched applications to use their own desktop's sound server and terminal settings.
+
+## [0.17.15] - 2026-11-15
+
+### Added
+
+- Host desktop audio on Linux (PulseAudio/PipeWire output monitors), macOS 13+ (ScreenCaptureKit), and Windows (WASAPI loopback). Install FFmpeg and unmute in the viewer to capture system output. Capture stops on mute/disconnect, and audio remains optional for desktop sharing.
+- Separate GNOME Wayland desktops now support audio in both the noVNC and frame viewers. Install `pipewire-pulse pulseaudio-utils ffmpeg`, restart Open Terminal, and unmute using the viewer's speaker button. Audio uses a private desktop sound server; missing audio packages do not disable the desktop.
+
+### Changed
+
+- Linux virtual desktops now default to XFCE, even when GNOME is installed. Select GNOME with `--desktop-environment gnome` or an explicit environment/config setting. The existing `auto` setting now selects XFCE.
+
+### Fixed
+
+- Fixed audio capture processes hanging during viewer disconnect when their output buffers were full.
+- Restored the Desktop option for GNOME Wayland installations without `x11vnc`. The package is optional: when installed, GNOME uses noVNC; otherwise it keeps the frame viewer.
+
+## [0.17.14] - 2026-11-15
+
+### Fixed
+
+- Pasting text into a virtual GNOME desktop now uses its private clipboard, preserving Unicode and avoiding modifier-key races with viewer input.
+
+## [0.17.13] - 2026-11-15
+
+### Changed
+
+- Separate GNOME Wayland desktops now use the noVNC viewer through LibVNCServer's raw-framebuffer backend. Install `x11vnc` in addition to the existing GNOME Wayland dependencies. Browser paste requires an updated Open WebUI. The VNC transport uses private sockets and opens no network listening port.
+- Desktop implementation modules now live together in `open_terminal/desktop/`.
+
+## [0.17.12] - 2026-11-15
+
+### Fixed
+
+- Fixed separate GNOME Wayland desktops getting stuck on "Connecting" when Open Terminal is started over SSH. The virtual desktop now excludes the inherited SSH connection marker that could deadlock GNOME's audio initialization on Xwayland.
+
+## [0.17.11] - 2026-11-15
+
+### Added
+
+- You can now start a separate GNOME desktop on Ubuntu 26.04 and other GNOME installations that only support Wayland. Use `open-terminal run --desktop-environment gnome` after installing the packages in the [desktop setup guide](docs/configuration.md#desktop). It works over SSH without a graphical login or on-screen approval. Once the desktop is open, apps launched by assistant commands open there too. This requires single-user mode and does not share sound; use XFCE if you need multiple users or sound sharing.
+- The startup banner now shows the installed Open Terminal version. You can also check it with `open-terminal --version`.
+
+### Fixed
+
+- Fixed sharing your existing Wayland desktop failing because Open Terminal looked for it inside the SSH session. It now finds the same user's logged-in desktop. Someone must still approve sharing on that desktop.
+- Fixed missed replies from the desktop's permission service that could leave sharing waiting until it timed out. Startup errors now identify the failed step and include the screen capture error when available. If approval times out, the message tells you to unlock the desktop and approve its sharing dialog, which does not appear in the SSH terminal.
+
+## [0.17.10] - 2026-11-15
+
+### Added
+
+- You can now share and control your actual logged-in Linux desktop, including its open windows, with `open-terminal run --desktop-mode host`. Supports X11 and compatible Wayland desktops such as Ubuntu GNOME. Run Open Terminal as the desktop's user in single-user mode. On Wayland, approve screen, keyboard, and mouse access on that desktop; you can stop sharing from its sharing indicator. Starting through SSH still requires someone logged in to the graphical desktop to approve access. Sound sharing is not available in host mode.
+
+### Changed
+
+- The separate Linux desktop now uses GNOME when a compatible GNOME X11 session is installed, otherwise XFCE. You can choose explicitly with `--desktop-environment gnome` or `--desktop-environment xfce`. Linux still opens a separate desktop by default, and the full Docker image still includes XFCE.
+- Added [Linux desktop setup instructions](docs/configuration.md#desktop) for both modes, including the packages needed when installing with uv or pip. Missing desktop dependencies now point to those instructions, and startup failures include the underlying error.
+
+## [0.17.9] - 2026-11-14
+
+### Added
+
+- Added support for choosing thinking effort in Claude Code, Pi, and compatible agents such as OpenCode from Open WebUI's model controls. Available choices match the selected model, and models without supported effort settings leave the control hidden. Requires an updated Open WebUI.
+
+### Fixed
+
+- Fixed file requests getting stuck when many tabs or connected clients were watching folders for changes. Opening the same folder in several views now shares the work of detecting changes, and watching folders no longer ties up the resources needed to read files.
+
+### Changed
+
+- Updated the README with a one-line `uvx open-terminal@latest` command that starts the latest release and shows where to set your API key.
+
+## [0.17.8] - 2026-11-13
+
+### Added
+
+- Added support for managing GitHub issues from Open WebUI's Git panel. You can browse and search issues, read their comments, create or edit an issue, add a comment, close it as completed or not planned, and reopen it. Requires an updated Open WebUI and GitHub CLI signed in to an account with access to the repository.
+- Pull-request and issue searches now search GitHub, including matches outside the first 50 items shown. The Git panel can show the repository's total open issue and pull-request counts, and pull-request lists can show labels, last-updated times, and check results. Requires an updated Open WebUI.
+- Terminal tab titles can now show the running program, such as Python or Node, and return to the shell name when it exits, even when the program does not set its own title. Available on Mac and Linux with an updated Open WebUI.
+
+### Fixed
+
+- Fixed coding-agent chats refusing system prompts longer than 65,536 characters. Open Terminal no longer imposes that limit. Claude Code and Pi still have a system-dependent limit; when it is exceeded, the error now says "Agent instructions are too long" instead of "Internal Server Error".
+
+## [0.17.7] - 2026-11-10
+
+### Added
+
+- You can set where every session starts with `OPEN_TERMINAL_START_DIR`, such as `~/app`. New shells and commands open there, and so does the file browser, unless a client picks another folder for the session. The folder must be inside home, and it's created at startup if it's missing.
+- You can run a setup script each time the terminal starts with `OPEN_TERMINAL_SETUP_SCRIPT`, for example to clone a repository and install its dependencies. It runs in the start directory before the server accepts requests. If it fails, the terminal still starts, and system info shows the exit code and the end of `~/.open-terminal/setup.log`.
+
+## [0.17.6] - 2026-11-09
+
+### Fixed
+
+- Fixed HTML previews showing "File not found" on Windows even when the assistant could read the same file. Pages stored on Windows drives now load from the correct location, along with their linked stylesheets and images. If you use Tether, update its Open Terminal installation to get this fix.
+
+## [0.17.5] - 2026-11-08
+
+### Added
+
+- Added a `cuda` Docker image with the full Open Terminal toolkit, CUDA development tools, and GPU-enabled PyTorch. You can compile GPU programs and run PyTorch workloads on a compatible NVIDIA GPU when Docker has access to it.
+- The full, agents, and cuda Docker images now include GitHub CLI (`gh`) for working with repositories, issues, and pull requests, plus `uv` and `uvx` for installing Python packages and running Python tools. Rebuild or update your image to get them.
+- Apps launched by assistant commands can now open windows on your running Linux Desktop. For example, asking the assistant to launch a browser can show its window in the Desktop tab. Open the desktop first; running a command does not start it automatically.
+
+### Fixed
+
+- Fixed Chromium closing immediately when launched from a command in the Docker image, even though it worked from the Desktop. Commands, notebooks, and coding agents now honor the same browser setting already used by the Desktop.
+
+## [0.17.4] - 2026-11-07
+
+### Added
+
+- Added support for the System info window in Open WebUI's terminal menu. Open it beside a terminal connection to check CPU and memory use, used and free disk space, how long the machine has been running, network addresses, and the programs using the most CPU or memory. Requires an updated Open WebUI.
+- System info uses detected container CPU and memory limits when available. Disk space is measured on the drive containing the terminal's current folder. In multi-user mode, the program list shows only the current user's processes.
+
+## [0.17.3] - 2026-11-07
+
+### Added
+
+- Added support for Tether to run Open Terminal without opening a directly accessible HTTP address. Your connected Open WebUI can still use the terminal through Tether. Direct HTTP access can be enabled for just your computer or for other computers on your network, and still requires an API key. Requires an updated Tether.
+- Other desktop apps can use the same connection mode through `--ipc`. See the [local connection setup](README.md#private-local-ipc).
+
+### Changed
+
+- The Linux Desktop now uses the Open WebUI homepage image as its default wallpaper in the full and agents Docker images. The image is bundled with Open Terminal. Update or rebuild your Docker image to get it.
+
+### Fixed
+
+- Fixed Docker's allowed-site restrictions being bypassed through IPv6 connections. When allowed-site restrictions or the block-all setting are enabled, new outgoing IPv6 connections are now blocked, including connections to allowed sites. Allowed sites remain reachable over IPv4.
+
+## [0.17.2] - 2026-11-06
+
+### Fixed
+
+- Fixed Discard in the Git panel leaving changes that were already marked for the next commit. Discard now returns selected existing files to their last committed version, including restoring deleted files and undoing renames. Changes to other files are kept. An updated Open WebUI is required to show Discard for every changed file.
+- Discard can now delete selected new files, whether or not they were marked for the next commit, including in projects with no commits yet. This permanently removes those files. Previously, Discard could not remove new files.
+- Fixed Discard leaving a file missing when its deletion or rename was marked for commit and another file was created with the original name. The last committed version is now restored.
+- Discard now reports a clear error when a selected folder contains its own Git repository, before changing any selected files. Previously, it reported success while leaving that folder on disk.
+
+## [0.17.1] - 2026-11-06
+
+### Added
+
+- Added support for showing Codex's reasoning effort and service tier options in Open WebUI's model controls, so you can choose how much effort it spends thinking and which service tier to use. Available choices and defaults come from your installed Codex version; options it does not report stay hidden. Requires an updated Open WebUI.
+
+### Fixed
+
+- Fixed repeated pauses before agent replies when checking which models are available. Previously, sending a Codex message could wait for another agent's slow startup or login check after the model list expired. Known models now remain available while the list refreshes in the background. With an updated Open WebUI, sending a message checks only the selected agent, so other agents cannot hold it up even on the first check.
+
+## [0.17.0] - 2026-11-06
+
+### Added
+
+- Added support for chatting with Codex, Claude Code, Cursor, Grok, OpenCode, Cline, Gemini CLI, and Pi through Open WebUI. Select your terminal in chat to see the models offered by its installed agents in the model selector. Requires an Open WebUI version with agent support. Install and sign in to each agent from the terminal first; the `agents` Docker image already includes Codex and Claude Code.
+- Agent chats work in the terminal's current folder. You can attach files, watch replies and tool activity as they happen, answer the agent's approval requests, stop a running reply, and continue the conversation with a follow-up message. Available approval prompts depend on the agent. Branching or regenerating an agent conversation requires a new chat.
+- Agent connections can recover from a brief interruption, catch up on unread output, and avoid sending the same input twice. Disconnecting does not immediately stop the agent; sessions left disconnected for more than an hour are closed during cleanup.
+- Added support for running local agents through Tether's saved Open WebUI connections. Your hosted Open WebUI can reach the agents on your computer through Tether without a public address for your computer. Requires Tether and Open WebUI versions with agent support; agent logins stay in the terminal environment.
+
+### Changed
+
+- Shortened the README around installation and connecting to Open WebUI. Moved detailed instructions for settings, Docker images, agent login, storage, multi-user setup, and temporary public access into linked guides, keeping the existing command examples.
+
+## [0.16.7] - 2026-11-06
+
+### Added
+
+- Added an `agents` Docker image with the latest Codex and Claude Code releases installed at build time alongside the full Open Terminal toolkit, with authentication configured per user at runtime. Includes AMD64 and ARM64 publishing and versioned `-agents` tags.
+
+## [0.16.6] - 2026-11-05
+
+### Fixed
+
+- Fixed the Browser tab stopping its live updates after opening a page or following a link in Chrome. The page view now resumes automatically once the new page loads, including when it finishes loading before the Browser panel is ready.
+
+## [0.16.5] - 2026-11-05
+
+### Changed
+
+- Reduced pauses between screen updates in the Browser tab and when sharing a Mac or Windows desktop over connections with noticeable delay, helping scrolling and animations stay smoother. Requires an updated Open WebUI. Browser views using the built-in Linux desktop keep their existing streaming behavior.
+
+### Fixed
+
+- Commands that print large amounts of text now slow down when the connected terminal cannot display it fast enough, preventing unread output from being discarded while the viewer catches up. Requires an updated Open WebUI.
+- Fixed terminal output getting stuck when a large paste was waiting for the running program to accept it. Output can now continue while the paste waits.
+
+## [0.16.4] - 2026-11-05
+
+### Fixed
+
+- Fixed pages using your running Chrome reverting to the Chrome window's size instead of the size selected in the Browser tab. Opening or resizing the tab, switching mobile preview, and changing display quality now keep the requested page size. Update Open WebUI as well for the related fix for pages appearing too small with empty space around them.
+- Reconnecting to a Browser tab now waits for its current size before showing the page and discards images left over from the previous connection, preventing a brief view of the page at the old size.
+
+## [0.16.3] - 2026-11-05
+
+### Added
+
+- The Browser tab can now open pages in your running Chrome using your existing website logins. Set `OPEN_TERMINAL_BROWSER_MODE=personal`, enable debugging in Chrome at `chrome://inspect/#remote-debugging`, restart Open Terminal, and approve the connection when Chrome asks. This requires single-user mode and works with Open WebUI's existing Chrome controls, without a WebUI update. See [setup instructions](docs/configuration.md#use-your-running-chrome).
+- When using your Chrome, Open Terminal opens its own tabs. Closing a Browser session or stopping Open Terminal closes those tabs while leaving Chrome and your other tabs open. If it cannot connect to the Chrome instance you selected, it reports the problem instead of opening a different browser.
+
+### Fixed
+
+- After Chrome closes, a tab closes, or the browser connection drops, attempts to control that tab now report that it disconnected and ask you to reopen it.
+
+## [0.16.2] - 2026-11-05
+
+### Added
+
+- Added `open-terminal run --isolated` and `OPEN_TERMINAL_ISOLATED=true` to start without loading saved system or user settings. Environment settings and a file explicitly selected with `--config` still apply.
+
+### Changed
+
+- Notebook support is now an optional install. Use `pip install 'open-terminal[notebooks]'` to include it. Open Terminal can start without the notebook packages, with notebook features disabled. The default Docker image still includes them.
+
+### Fixed
+
+- Terminal connections can now drop and reconnect without immediately stopping the shell or its running programs. Output continues to be collected while disconnected, with up to 1 MiB kept for reconnection. Connected apps can resume from where they left off; terminals left disconnected for more than five minutes are closed during the next cleanup.
+- Failed uploads no longer overwrite an existing file with incomplete content. The original file is replaced only after the upload has been fully written.
+
 ## [0.16.1] - 2026-11-04
 
 ### Fixed

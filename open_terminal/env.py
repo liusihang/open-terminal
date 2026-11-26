@@ -1,4 +1,5 @@
 import os
+import sys
 
 from open_terminal import config
 
@@ -6,6 +7,9 @@ from open_terminal import config
 def sanitized_environ(extra: dict[str, str] | None = None) -> dict[str, str]:
     """Exclude inherited server settings; explicit command overrides still win."""
     env = {key: value for key, value in os.environ.items() if not key.startswith("OPEN_TERMINAL_")}
+    if BROWSER_NO_SANDBOX:
+        # The Docker image's Chromium launcher reads this to add --no-sandbox.
+        env["OPEN_TERMINAL_BROWSER_NO_SANDBOX"] = "true"
     if extra:
         env.update(extra)
     return env
@@ -67,12 +71,12 @@ BINARY_FILE_MIME_PREFIXES = [
     if p.strip()
 ]
 
-MAX_TERMINAL_SESSIONS = int(
-    os.environ.get(
-        "OPEN_TERMINAL_MAX_SESSIONS",
-        config.get("max_terminal_sessions", "16"),
-    )
+# Leave empty for unlimited.
+MAX_TERMINAL_SESSIONS = os.environ.get(
+    "OPEN_TERMINAL_MAX_SESSIONS",
+    config.get("max_terminal_sessions", ""),
 )
+MAX_TERMINAL_SESSIONS = int(MAX_TERMINAL_SESSIONS) if MAX_TERMINAL_SESSIONS != "" else None
 
 ENABLE_TERMINAL = os.environ.get(
     "OPEN_TERMINAL_ENABLE_TERMINAL",
@@ -139,6 +143,11 @@ ENABLE_NOTEBOOKS = os.environ.get(
     str(config.get("enable_notebooks", True)),
 ).lower() not in ("false", "0", "no")
 
+# Notebook support is optional; the base package must start without Jupyter.
+if ENABLE_NOTEBOOKS:
+    from importlib.util import find_spec
+    ENABLE_NOTEBOOKS = all(find_spec(module) is not None for module in ("nbclient", "ipykernel"))
+
 ENABLE_BROWSER = os.environ.get(
     "OPEN_TERMINAL_ENABLE_BROWSER",
     str(config.get("enable_browser", True)),
@@ -148,10 +157,34 @@ BROWSER_NO_SANDBOX = os.environ.get(
     "OPEN_TERMINAL_BROWSER_NO_SANDBOX", "false"
 ).lower() in ("true", "1", "yes")
 
+BROWSER_MODE = os.environ.get(
+    "OPEN_TERMINAL_BROWSER_MODE", config.get("browser_mode", "managed")
+).lower()
+if BROWSER_MODE not in ("managed", "personal"):
+    raise ValueError("OPEN_TERMINAL_BROWSER_MODE must be 'managed' or 'personal'")
+BROWSER_CDP_URL = os.environ.get(
+    "OPEN_TERMINAL_BROWSER_CDP_URL", config.get("browser_cdp_url", "")
+)
+BROWSER_USER_DATA_DIR = os.environ.get(
+    "OPEN_TERMINAL_BROWSER_USER_DATA_DIR", config.get("browser_user_data_dir", "")
+)
+
 ENABLE_DESKTOP = os.environ.get(
     "OPEN_TERMINAL_ENABLE_DESKTOP",
     str(config.get("enable_desktop", True)),
 ).lower() not in ("false", "0", "no")
+
+DESKTOP_MODE = os.environ.get(
+    "OPEN_TERMINAL_DESKTOP_MODE",
+    config.get("desktop_mode", "virtual" if sys.platform == "linux" else "host"),
+).lower()
+if DESKTOP_MODE not in ("virtual", "host"):
+    raise ValueError("OPEN_TERMINAL_DESKTOP_MODE must be 'virtual' or 'host'")
+DESKTOP_ENVIRONMENT = os.environ.get(
+    "OPEN_TERMINAL_DESKTOP_ENVIRONMENT", config.get("desktop_environment", "xfce")
+).lower()
+if DESKTOP_ENVIRONMENT not in ("auto", "gnome", "xfce"):
+    raise ValueError("OPEN_TERMINAL_DESKTOP_ENVIRONMENT must be 'auto', 'gnome', or 'xfce'")
 
 ENABLE_SYSTEM_PROMPT = os.environ.get(
     "OPEN_TERMINAL_ENABLE_SYSTEM_PROMPT",
@@ -195,6 +228,19 @@ FILE_BROWSER_ROOT = os.environ.get(
     "OPEN_TERMINAL_FILE_BROWSER_ROOT",
     config.get("file_browser_root", "home"),
 ).strip()
+
+# Where every session, shell, and command starts unless a request names a directory.
+# "~", "~/path", or a path relative to home; folders outside home are ignored.
+START_DIR = os.environ.get(
+    "OPEN_TERMINAL_START_DIR",
+    config.get("start_dir", ""),
+).strip()
+
+# Shell script run in START_DIR each time the server starts, before it accepts requests.
+SETUP_SCRIPT = os.environ.get(
+    "OPEN_TERMINAL_SETUP_SCRIPT",
+    config.get("setup_script", ""),
+)
 
 # How long (in seconds) to keep per-session cwd entries in memory.
 # Sliding window — refreshed on every access.

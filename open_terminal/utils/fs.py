@@ -3,15 +3,14 @@
 Provides :class:`UserFS`, a unified interface for file operations.
 
 All I/O uses native Python (``aiofiles`` / ``os``).  In multi-user mode
-the server process is added to each provisioned user's group, and home
-directories are ``chmod 2770`` (setgid + group rwx), so standard file
-operations work without subprocess.
+workspace directories use setgid so that new files inherit their workspace's group.
 
 After each write operation a ``sudo chown`` call fixes file ownership
 so that files belong to the provisioned user, not the server process.
 """
 
 import asyncio
+import difflib
 import os
 import io
 import json
@@ -70,6 +69,18 @@ def line_range_offsets(text, start_line=None, end_line=None):
             if number >= last_boundary:
                 break
     return start, end
+
+
+def edit_patch(path: str, old: str, new: str) -> str | None:
+    """Return the edit from *old* to *new* as a unified diff.
+
+    The diff goes to the model too, so it is left out (None) when its lines take more space
+    than the old and new file together, as in a full rewrite. Clients then show the edit
+    from the request instead.
+    """
+    lines = list(difflib.unified_diff(old.splitlines(), new.splitlines(), path, path, n=3, lineterm=""))
+    changes = sum(len(line) + 1 for line in lines[2:] if not line.startswith("@@"))
+    return "\n".join(lines) if changes <= len(old) + len(new) else None
 
 
 def text_chunks(source):
@@ -207,19 +218,22 @@ class UserFS:
     async def _chown(self, path: str) -> None:
         """Fix ownership of *path* to the provisioned user.
 
-        Also sets group-write permission so the server process (which is
-        in the provisioned user's group) can overwrite the file on
-        subsequent writes.
+        Also sets group read/write permissions so the server process can
+        read and overwrite the file via the workspace's group.
         """
         if self.username:
+            in_home = os.path.commonpath([os.path.abspath(path), self.home]) == self.home
+            group = self.username
+            if in_home and (await aiofiles.os.stat(self.home)).st_gid == os.getegid():
+                group = os.getegid()
             await asyncio.to_thread(
                 subprocess.run,
-                ["sudo", "chown", f"{self.username}:{self.username}", path],
+                ["sudo", "chown", f"{self.username}:{group}", "--", path],
                 check=True, capture_output=True,
             )
             await asyncio.to_thread(
                 subprocess.run,
-                ["sudo", "chmod", "g+w", path],
+                ["sudo", "chmod", "g+rw", path],
                 check=True, capture_output=True,
             )
 
@@ -242,8 +256,7 @@ class UserFS:
             ["sudo", "-u", self.username, "mkdir", "-p", path],
             check=True, capture_output=True,
         )
-        # Walk upward, setting 2770 so the server process (which is in the
-        # user's group) can create files inside these directories.
+        # Walk upward, setting 2770 so the server process can create files in these directories.
         target = os.path.normpath(path)
         home = os.path.normpath(self.home)
         while target != home and target.startswith(home + "/"):

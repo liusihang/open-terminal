@@ -29,7 +29,7 @@
 #  Compiles Python dependencies in an isolated prefix.  Alpine needs
 #  musl-dev and gcc for most C extensions.
 # --------------------------------------------------------------------------
-FROM python:3.12.13-alpine AS builder
+FROM python:3.12.16-alpine AS builder
 
 WORKDIR /src
 
@@ -55,7 +55,7 @@ RUN pip install --no-cache-dir --prefix=/install .
 #  Stage 2: Runtime
 #  Tiny Alpine runtime.  No compilers, no build tools, no sudo.
 # --------------------------------------------------------------------------
-FROM python:3.12.13-alpine
+FROM python:3.12.16-alpine
 
 # ── Runtime system packages ────────────────────────────────────────────────
 #
@@ -65,7 +65,7 @@ FROM python:3.12.13-alpine
 #   Core:        tini (PID 1), su-exec (drop privileges, Alpine's gosu)
 #   Utilities:   curl, git, jq, less, procps (ps/top)
 #   Firewall:    iptables, ipset, dnsmasq (egress whitelist)
-#   Shell:       bash (the terminal API spawns bash sessions)
+#   Shell:       bash (used for interactive terminal sessions)
 #
 # ➡️  Want more tools?  Add them here, one per line for easy diffs:
 #     e.g.  vim \

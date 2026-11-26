@@ -30,6 +30,7 @@ from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 from open_terminal.dependencies import get_filesystem, verify_api_key
+from open_terminal.env import BROWSER_MODE
 from open_terminal.utils.fs import UserFS
 from .rewrite import (
     proxy_path,
@@ -118,12 +119,20 @@ def owner(request):
     return request.headers.get("x-user-id") or "single"
 
 
+def in_chat(session, request):
+    """Whether the session belongs to the chat, or to the workspace the chat is in."""
+    workspace = request.headers.get("x-workspace-id")
+    return session.chat == request.headers.get("x-session-id", "") or bool(
+        workspace and session.chat == workspace
+    )
+
+
 def owned(request, sid):
     session = sessions.get(sid)
     if (
         not session
         or session.owner != owner(request)
-        or session.chat != request.headers.get("x-session-id", "")
+        or not in_chat(session, request)
     ):
         raise HTTPException(404, "Browser session not found")
     session.touched = time.monotonic()
@@ -147,7 +156,7 @@ def payload(session):
         "url": session.url,
         "title": session.title,
         "mode": session.mode,
-        "chrome_available": find_browser() is not None,
+        "chrome_available": BROWSER_MODE == "personal" or find_browser() is not None,
     }
 
 
@@ -487,7 +496,7 @@ async def chrome_socket(ws: WebSocket, sid: str, token: str):
     except HTTPException:
         await ws.close(code=4004)
         return
-    if not session.chrome:
+    if not session.chrome or session.chrome.detached or session.chrome.host.reader.done():
         await ws.close(code=4004)
         return
     vnc = ws.url.path.endswith("/vnc")
@@ -505,8 +514,7 @@ def visible_sessions(request):
     return [
         s
         for s in sessions.values()
-        if s.owner == owner(request)
-        and s.chat == request.headers.get("x-session-id", "")
+        if s.owner == owner(request) and in_chat(s, request)
     ]
 
 
@@ -533,6 +541,8 @@ async def browser_page(request, session_id=None):
                 "This Browser tab is in Proxy mode. Switch that tab to Chrome to control it.",
             )
         chrome = session.chrome
+        if chrome.detached or chrome.host.reader.done():
+            raise HTTPException(409, "Chrome tab disconnected. Reopen this browser tab.")
         async with chrome.host.view_lock:
             # Headed Chrome cannot reliably capture background pages.
             if chrome.host.display:
