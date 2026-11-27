@@ -1,0 +1,337 @@
+# Configuration
+
+[← README](../README.md)
+
+Open Terminal can be configured via a TOML config file, environment variables, and CLI flags. Settings are resolved in this order (highest priority wins):
+
+1. **CLI flags** (`--host`, `--port`, `--api-key`, etc.)
+2. **Environment variables** (`OPEN_TERMINAL_API_KEY`, etc.)
+3. **User config** — `$XDG_CONFIG_HOME/open-terminal/config.toml` (defaults to `~/.config/open-terminal/config.toml`)
+4. **System config** — `/etc/open-terminal/config.toml`
+5. **Built-in defaults**
+
+Create a config file at either location with any of these keys (all optional):
+
+```toml
+host = "0.0.0.0"
+port = 8000
+api_key = "sk-my-secret-key"
+cors_allowed_origins = "*"
+log_dir = "/var/log/open-terminal"
+binary_mime_prefixes = "image,audio"
+execute_timeout = 5  # seconds to wait for command output (unset by default)
+file_browser_root = "home"
+enable_browser = true
+enable_desktop = true
+```
+
+Browser and desktop support are enabled by default. Set `OPEN_TERMINAL_ENABLE_BROWSER=false`
+or `OPEN_TERMINAL_ENABLE_DESKTOP=false` to disable their HTTP and WebSocket endpoints
+and advertise them as disabled in `/api/config`. Values `false`, `0`, and `no`
+(case-insensitive) disable the feature. Restart the server after changing these settings.
+Desktop support still requires its platform dependencies to be available.
+
+> [!TIP]
+> Use the system config at `/etc/open-terminal/config.toml` to set site-wide defaults for host and port, and the user config for personal settings like the API key — this keeps the key out of `ps` / `htop`.
+
+You can also point to a specific config file:
+
+```bash
+open-terminal run --config /path/to/my-config.toml
+```
+
+## Desktop
+
+Linux defaults to a **separate XFCE virtual desktop**, even when GNOME is installed.
+Docker `latest` includes XFCE. Select GNOME explicitly when wanted:
+
+```sh
+open-terminal run                             # XFCE (default)
+open-terminal run --desktop-environment gnome # Explicit GNOME
+```
+
+On **Debian and Ubuntu**, one command installs what the default XFCE desktop and
+Chrome tabs need:
+
+```sh
+open-terminal install-deps                       # Desktop and Chrome tabs
+open-terminal install-deps desktop               # Only one of them
+open-terminal install-deps --dry-run             # Show the command without running it
+open-terminal install-deps --package libreoffice # Any other apt package
+```
+
+It skips what is already installed, shows the command and asks before running
+it, and uses `sudo` when not run as root. Pass `--yes` to skip the question, for
+example from a script; without a terminal, `sudo` reads its password from
+standard input. On Ubuntu, Chrome tabs get Google Chrome's own package (x86-64
+only), because Ubuntu ships Chromium only as a snap. Restart Open Terminal
+afterwards. GNOME, host mode, and other distributions need the packages below.
+
+On **Ubuntu 26.04 and other Wayland-only GNOME installations**, install:
+
+```sh
+sudo apt install gnome-shell dbus-daemon pipewire wireplumber gstreamer1.0-tools gstreamer1.0-pipewire gstreamer1.0-plugins-base libgl1-mesa-dri
+open-terminal run --desktop-mode virtual --desktop-environment gnome
+```
+
+Open Terminal starts a headless GNOME Shell with its own virtual monitor, D-Bus
+session, and PipeWire services. It works over SSH without a graphical login or
+an on-screen permission prompt. Install the optional `x11vnc` package
+(`sudo apt install x11vnc`) to use noVNC, like XFCE, then restart Open Terminal.
+Without it, GNOME uses the frame viewer and the Desktop option remains available.
+Commands launched through the API inherit this virtual
+desktop's display and bus so Wayland apps open there. The logged-in host desktop
+is not used. This backend currently requires single-user mode;
+multi-user deployments keep the XFCE fallback when GNOME is Wayland-only.
+It is tested with Ubuntu 26.04/GNOME 50.
+
+For **GNOME Wayland audio**, install these optional packages, then restart Open Terminal:
+
+```sh
+sudo apt install pipewire-pulse pulseaudio-utils ffmpeg
+```
+
+Click the viewer's speaker button to unmute. Sound works with both noVNC and the
+frame viewer through a separate authenticated audio stream. Apps in the virtual
+desktop use its private sound server, including apps launched through the API.
+The host's sound and microphone are not captured. Without the audio packages,
+the desktop remains available without sound.
+
+With noVNC, GNOME still runs on Wayland: PipeWire supplies frames to
+[`x11vnc`'s raw-framebuffer mode](https://github.com/LibVNC/x11vnc/blob/master/x11vnc.1),
+and input goes back through the owned Mutter session. LibVNCServer handles the
+VNC protocol. Each authenticated viewer gets a private socket pair; no VNC TCP
+port is opened. Browser paste requires an updated Open WebUI and transfers UTF-8
+text through the private GNOME clipboard. Automatic clipboard synchronization
+is not provided by this backend.
+
+Ubuntu's [documented GNOME remote access route is RDP](https://documentation.ubuntu.com/desktop/en/24.04/how-to/share-your-desktop-remotely/).
+The raw-framebuffer transport above keeps noVNC compatibility using packaged dependencies.
+Upstream [GNOME Remote Desktop](https://github.com/GNOME/gnome-remote-desktop/blob/50.2/README.md)
+also supports headless VNC, but Ubuntu 26.04 builds it without VNC support.
+[TigerVNC's `w0vncserver`](https://tigervnc.org/doc/w0vncserver.html) shares an
+existing Wayland session through the remote-desktop portal; it does not create
+the separate desktop. [`wayvnc`](https://github.com/any1/wayvnc) does not support GNOME.
+
+For **XFCE or older GNOME installations with an X11 session**, install the VNC tools:
+
+```sh
+sudo apt install tigervnc-standalone-server dbus-x11 x11-utils xauth xdotool scrot xclip
+```
+
+You also need a compatible desktop session: `gnome-session` with X11 support,
+or `xfce4 xfce4-terminal`. Debian 13 packages GNOME's X11 session separately as
+`gnome-session-xsession`; install it as well when using GNOME there.
+Keep your existing display manager if the installer
+asks; Open Terminal starts its own session and does not need LightDM or GDM.
+When GNOME has no X11 session, Open Terminal selects the Wayland backend instead
+of TigerVNC. Missing dependencies produce an error for the selected backend;
+they never cause a connection to the host desktop. Restart after installation.
+
+Virtual XFCE sessions prefer `xfce4-terminal` and use their own session defaults
+so GNOME startup services are not inherited. Host network, power, color, and
+login-keyring autostart services are disabled in the virtual session only;
+host settings and authentication policy are unchanged. Applications can still
+request access to the login keyring through D-Bus and prompt to unlock it;
+disabling autostart does not unlock the keyring. If Ubuntu's terminal
+shows “Failed to connect to user scope bus,” press **Alt+F2** in the desktop and
+run `xfce4-terminal`.
+
+For audio in these X11 virtual desktops, install `pulseaudio pulseaudio-utils ffmpeg`
+and restart Open Terminal. The full Docker images already include these packages.
+Slim images require desktop and audio packages to be installed separately.
+
+To share **your actual logged-in desktop and its open windows**, opt in explicitly:
+
+```sh
+open-terminal run --desktop-mode host
+```
+
+Host mode requires single-user operation as the desktop's OS user. On Linux
+X11, run from a graphical terminal so `DISPLAY` and `XAUTHORITY` identify that
+session; install `xclip` for clipboard input. On Wayland/GNOME, install:
+
+```sh
+sudo apt install xdg-desktop-portal xdg-desktop-portal-gnome gstreamer1.0-tools gstreamer1.0-pipewire gstreamer1.0-plugins-base
+```
+
+Approve monitor, keyboard, and pointer access once in the dialog on your Ubuntu
+desktop. Open Terminal requests persistent authorization and remembers it when
+the portal grants it, so later connections and server restarts can reuse that
+approval, including over SSH. Older portals, revoked permissions, or a changed
+monitor may require approval again. Sharing can be stopped from the desktop's
+sharing indicator. A GNOME VNC/RDP server is not needed.
+From SSH, run as the same OS user: Open Terminal can reach that user's existing
+desktop portal even when `XDG_SESSION_TYPE=tty`. Someone must still be logged in
+to the graphical desktop and approve the initial dialog there. Host mode never starts
+a new desktop as a fallback. Pasting on Wayland types plain text. Other characters need
+clipboard access, which GNOME offers in the sharing dialog. To add it to an existing
+approval, delete `~/.local/state/open-terminal/desktop-restore-token`, restart Open Terminal,
+and approve sharing again on the desktop. In a terminal, paste such text with Ctrl+Shift+V.
+Host audio captures the logged-in desktop's sound output when you unmute the
+viewer. It does not capture the microphone. Install **FFmpeg** with Opus support
+and ensure `ffmpeg` is on the server's `PATH`, then restart Open Terminal:
+
+| Host platform | Capture method and requirements |
+| --- | --- |
+| Linux, X11 or Wayland | The current user's PulseAudio/PipeWire output monitor. On Ubuntu/Debian, install `pulseaudio-utils ffmpeg`. Use the existing desktop audio server. |
+| macOS 13+ | ScreenCaptureKit system audio. Allow screen/system audio recording for the app running Open Terminal. FFmpeg can be installed with `brew install ffmpeg`. |
+| Windows | WASAPI loopback on the default output device. Install FFmpeg and run Open Terminal in the logged-in desktop session. No virtual audio driver is needed. |
+
+If that FFmpeg includes libx264, the native (non-VNC) Desktop viewer also uses H.264
+for large screen changes such as video and scrolling. The browser must reach Open WebUI
+over HTTPS or localhost; otherwise, or if either side cannot use H.264, it uses JPEG.
+
+On Windows with one display, FFmpeg 7 or newer also captures the screen faster and shows
+the real cursor. Otherwise a basic capture is used.
+
+The macOS and Windows Python capture bindings install automatically on their
+respective platforms. Capture starts on unmute and stops on mute or disconnect.
+After changing the default speakers/headphones on Linux or Windows, mute and
+unmute to select the new output. Missing audio dependencies or denied capture
+permission do not disable desktop sharing. Docker virtual desktops use their
+own audio server; a container does not automatically gain access to its host's sound.
+
+SSH host mode uses the same OS user's desktop bus at `/run/user/<uid>/bus`,
+even if the SSH shell has a private D-Bus address. Startup errors identify the
+failed portal request or PipeWire capture stage and include GStreamer errors.
+A permission timeout means you should check the sharing dialog on the unlocked
+Ubuntu desktop; it will not appear in the SSH terminal.
+
+The authorization token is stored with owner-only permissions in
+`$XDG_STATE_HOME/open-terminal/desktop-restore-token` (default:
+`~/.local/state/open-terminal/desktop-restore-token`) and renewed after each
+successful portal connection. To forget saved approval, stop Open Terminal and
+delete that file; the next connection will ask again. If the portal does not
+grant persistent access or the token cannot be saved, the server logs a warning.
+
+The equivalent environment variables are `OPEN_TERMINAL_DESKTOP_MODE`
+(`virtual` or `host`) and `OPEN_TERMINAL_DESKTOP_ENVIRONMENT`
+(`xfce` by default, or `gnome`; `auto` is retained as an alias for XFCE);
+TOML keys are `desktop_mode` and `desktop_environment`. CLI flags take precedence.
+Restart after changing modes.
+macOS and Windows keep their existing host-desktop behavior by default.
+
+## Use your running Chrome
+
+Browser defaults to `managed`: Open Terminal launches a separate Chrome profile.
+To open tabs in your running Chrome with its signed-in sessions, select `personal`:
+
+```sh
+export OPEN_TERMINAL_BROWSER_MODE=personal
+```
+
+In Chrome 144+, enable debugging at `chrome://inspect/#remote-debugging` and approve
+the connection when Chrome asks. Open Terminal reads `DevToolsActivePort` from the
+current OS user's normal Chrome data directory. To select another instance, set
+one of these optional overrides:
+
+```sh
+export OPEN_TERMINAL_BROWSER_USER_DATA_DIR="/path/to/chrome-user-data"
+# Or connect to an explicit HTTP debugging address or ws:// / wss:// endpoint:
+export OPEN_TERMINAL_BROWSER_CDP_URL="http://127.0.0.1:9222"
+```
+
+An explicit CDP URL takes precedence over the data directory. If the selected
+instance is unavailable, Open Terminal returns an error rather than launching or
+choosing another browser. The equivalent TOML keys are `browser_mode`,
+`browser_user_data_dir`, and `browser_cdp_url`. Restart Open Terminal after changes.
+
+Use Chrome mode in WebUI as usual. Open Terminal creates a tab in the configured
+browser using the same session API, tools, and viewer. No WebUI changes are needed.
+Closing the session or stopping Open Terminal closes the tabs it created, leaving
+your browser and other tabs open. Personal mode requires single-user operation.
+
+Chromium's sandbox is enabled by default outside Docker. All published Docker image
+variants set `OPEN_TERMINAL_BROWSER_NO_SANDBOX=true` so Browser can start under
+Docker's default security restrictions when Chromium is installed. This applies to
+managed Browser tabs, and in the full Docker image also to Chromium launched from
+the Linux Desktop or from commands. Container isolation remains unchanged, but
+Chromium's own sandbox no longer protects files and processes inside the container
+from a browser exploit.
+
+To enable Chromium's sandbox in Docker, pass
+`-e OPEN_TERMINAL_BROWSER_NO_SANDBOX=false` when creating the container; the runtime
+must permit Chromium's sandbox operations. Outside Docker, set the variable to
+`true` only if your deployment cannot support the sandbox. Values `true`, `1`, and
+`yes` (case-insensitive) disable the sandbox. Restart or recreate Open Terminal
+after changing this setting.
+
+## Memory management
+
+File and command-output responses stream from disk, uploads are copied in chunks,
+and generated ZIP/PDF files are removed after sending or cancellation. Log rotation
+retains the newest half without loading the entire log into memory. Search listings
+and ranking use temporary disk storage while preserving full matches.
+
+Process, terminal, notebook, and document-worker cleanup releases readers, file
+handles, and child processes on completion, cancellation, or server shutdown.
+Command-log retention and the notebook idle timeout still apply.
+
+## File Browser Root
+
+Open Terminal reports file-browser root metadata from `GET /files/cwd` so clients can hide parent navigation above a friendly starting point.
+
+Set `OPEN_TERMINAL_FILE_BROWSER_ROOT` to:
+
+| Value | Behavior |
+|---|---|
+| `home` | Default. Report the current user's home directory as `Home` |
+| `/workspace` | Report an explicit path as the visual root |
+| `{{home}}/project` | Report a path under the current user's home |
+| `filesystem` | Opt out and report no visual root metadata |
+
+This is a UI hint for clients. It does not restrict terminal commands or file APIs.
+
+## Start Directory
+
+Set `OPEN_TERMINAL_START_DIR` to choose where every session starts: new shells, commands
+run without a `cwd`, and the working directory `GET /files/cwd` reports before a client
+changes it. Directories a client sets for a session still take precedence.
+
+| Value | Behavior |
+|---|---|
+| unset or `~` | Default. Start in the home directory |
+| `~/project` or `project` | Start in a folder inside home |
+| `/home/user/project` | An absolute path, used only if it is inside home |
+
+Paths outside home are ignored, because a managed terminal keeps only its home folder
+between restarts. The folder is created at startup if it doesn't exist.
+
+## Setup Script
+
+Set `OPEN_TERMINAL_SETUP_SCRIPT` to a shell script that runs each time the server starts,
+before it accepts requests. It runs in the start directory as the terminal user, with
+`bash -l -e` (or `sh -e` when bash isn't installed), so it stops at the first failing
+command. Open Terminal's own `OPEN_TERMINAL_*` settings, including the API key, are not
+passed to it.
+
+```bash
+test -d app || git clone https://github.com/acme/app app
+cd app && npm install
+```
+
+Only the home folder survives a restart, so write the script to be safe to run again.
+Output goes to `~/.open-terminal/setup.log`. A failing script does not stop the server:
+`GET /system/info` reports `setup.status` as `failed` with the exit code and the end of
+the log. Multi-user servers skip the setup script. Because the server isn't ready until
+the script finishes, keep it within your orchestrator's start timeout.
+
+## External Workspace Storage
+
+Open Terminal uses the filesystem it is mounted on. To store workspace files
+externally, mount that storage into the container:
+
+- Single-user: `/home/user`
+- Multi-user: `/home`
+
+This can be a Docker volume, Kubernetes persistent volume, NFS/Azure Files
+mount, or FUSE mount such as blobfuse, s3fs, or rclone.
+
+## Office Previews
+
+`GET /files/view?path=...` always returns the original file by default. Clients
+that want a rendered preview can add `preview=true`; when LibreOffice is
+available the server can return DOCX and PPTX previews as PDF. When rendered
+preview support is not available, the same endpoint falls back to returning the
+original file bytes.

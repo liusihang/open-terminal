@@ -44,11 +44,11 @@ def test_feature_discovery_and_action_schemas(client):
     assert config == {
         "terminal": main.ENABLE_TERMINAL, "notebooks": main.ENABLE_NOTEBOOKS,
         "system": main.ENABLE_SYSTEM_PROMPT, "git": main.shutil.which("git") is not None,
-        "events": True, "browser": main.ENABLE_BROWSER,
+        "events": True, "agents": True, "browser": main.ENABLE_BROWSER,
         "desktop": main.ENABLE_DESKTOP and main.desktop_available(),
     }
     assert all(type(value) is bool for value in config.values())
-    from open_terminal.desktop import ActionRequest
+    from open_terminal.desktop.router import ActionRequest
     assert "actions" in ActionRequest.model_json_schema()["required"]
     schema = client.get("/openapi.json").json()
     action_endpoints = ["/browser/action"]
@@ -141,7 +141,7 @@ def test_events_auth_preserves_session_cwd(client, tmp_path, monkeypatch):
 
 
 def test_desktop_stream_auth_with_mock_backend(client, monkeypatch):
-    import open_terminal.desktop as desktop
+    import open_terminal.desktop.router as desktop
     class FakeDesktop:
         audio_available = True
         async def stream(self, ws):
@@ -192,26 +192,31 @@ def test_non_repository_watcher_does_not_recurse(tmp_path):
 
 def test_dockerfile_keeps_custom_installation_and_upstream_runtime():
     dockerfile = Path("Dockerfile").read_text()
-    assert "FROM python:3.12.13" in dockerfile
+    assert "FROM python:3.12.16" in dockerfile
     for required in ("r-base r-base-dev", "https://mirrors.tuna.tsinghua.edu.cn/CRAN/", "/etc/R/Rprofile.site", "PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple", "npm install -g @officecli/officecli@1.0.132", "officecli --version", "chromium chromium-sandbox", "fonts-noto-color-emoji", "tigervnc-standalone-server xfce4", "pulseaudio pulseaudio-utils", "ENV OPEN_TERMINAL_BROWSER_NO_SANDBOX=true"):
         assert required in dockerfile
 
 
-def test_existing_terminal_session_auth_without_opening_shell(client, monkeypatch):
-    session = {"user_id": AUTH["X-User-Id"], "chat_id": AUTH["X-Session-Id"], "connected": True, "backend": "pty", "created_at": "test", "pid": 123}
-    monkeypatch.setattr(main, "_terminal_sessions", {"fixture-shell": session})
-    monkeypatch.setattr(main, "_session_is_alive", lambda _: True)
+def test_existing_terminal_session_auth_and_multi_viewer(client, monkeypatch):
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    session = client.post("/api/terminals").json()
+    path = f"/api/terminals/{session['id']}"
     try:
-        assert client.get("/api/terminals/fixture-shell").json()["id"] == "fixture-shell"
-        assert client.get("/api/terminals/fixture-shell", headers={"X-User-Id": "foreign"}).status_code == 404
-        for headers, token, code in (({}, "wrong-token", 4001), ({"X-User-Id": "foreign"}, "test-token", 4004), ({}, "test-token", 4009)):
-            with client.websocket_connect("/api/terminals/fixture-shell", headers=headers) as ws:
+        assert client.get(path).json()["id"] == session["id"]
+        assert client.get(path, headers={"X-User-Id": "foreign"}).status_code == 404
+        for headers, token, code in (({}, "wrong-token", 4001), ({"X-User-Id": "foreign"}, "test-token", 4004), ({"X-Session-Id": "other-chat"}, "test-token", 4004)):
+            with client.websocket_connect(path, headers=headers) as ws:
                 ws.send_json({"type": "auth", "token": token})
                 with pytest.raises(WebSocketDisconnect) as error:
                     ws.receive_json()
                 assert error.value.code == code
+        auth = {"type": "auth", "token": "test-token", "resume": True, "flow_control": True}
+        with client.websocket_connect(path) as first, client.websocket_connect(path) as second:
+            for viewer in (first, second):
+                viewer.send_json(auth)
+                assert viewer.receive_json() == {"type": "flow_control"}
     finally:
-        main._terminal_sessions.clear()  # fixture metadata has no real process to clean up
+        assert client.delete(path).status_code == 200
 
 
 def test_browser_page_proxy_rewrites_resources_and_strips_credentials(client):

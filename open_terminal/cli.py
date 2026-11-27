@@ -1,12 +1,13 @@
 import os
+from importlib.metadata import version
 
 import click
-import uvicorn
 
 
 @click.group()
+@click.version_option(package_name="open-terminal")
 def main():
-    """open-terminal — terminal interaction API"""
+    """Open Terminal provides a remote machine API."""
     pass
 
 
@@ -23,8 +24,9 @@ BANNER = r"""
 
 
 @main.command()
-@click.option("--host", default=None, help="Bind host (default: 127.0.0.1 with --cftunnel, otherwise 0.0.0.0)")
-@click.option("--port", default=None, type=int, help="Bind port (default: 8000)")
+@click.option("--host", default=None, help="Bind host (default: 127.0.0.1 with --ipc or --cftunnel, otherwise 0.0.0.0)")
+@click.option("--port", default=None, type=click.IntRange(0, 65535), help="Bind port (default: 8000; with --ipc, explicitly enables TCP)")
+@click.option("--ipc", default=None, help="Serve over a Unix socket or Windows named pipe instead of TCP.")
 @click.option(
     "--config",
     "config_path",
@@ -54,7 +56,16 @@ BANNER = r"""
     "--cftunnel", is_flag=True,
     help="Publish a temporary public HTTPS URL using Cloudflare. Requires a configured API key; offers to download cloudflared if needed.",
 )
+@click.option("--isolated", is_flag=True, help="Ignore system and user configuration files.")
 @click.option("--yes", is_flag=True, help="Approve the pinned cloudflared download (requires --cftunnel).")
+@click.option(
+    "--desktop-mode", type=click.Choice(["virtual", "host"]), default=None,
+    help="Linux desktop: separate session (default) or share the logged-in desktop.",
+)
+@click.option(
+    "--desktop-environment", type=click.Choice(["auto", "gnome", "xfce"]), default=None,
+    help="Virtual desktop environment (default: XFCE; auto also selects XFCE). Choose gnome explicitly to use GNOME.",
+)
 def run(
     host: str | None,
     port: int | None,
@@ -64,6 +75,10 @@ def run(
     cors_allowed_origins: str,
     cftunnel: bool,
     yes: bool,
+    isolated: bool,
+    ipc: str | None,
+    desktop_mode: str | None,
+    desktop_environment: str | None,
 ):
     """Start the sandbox API server."""
     import secrets
@@ -73,12 +88,25 @@ def run(
 
     if yes and not cftunnel:
         raise click.UsageError("--yes requires --cftunnel.")
+    if ipc and cftunnel:
+        raise click.UsageError("--ipc cannot be combined with --cftunnel.")
+    if ipc and host is not None and port is None:
+        raise click.UsageError("--host requires --port when using --ipc.")
+    if ipc and os.name == "nt" and not ipc.startswith("\\\\.\\pipe\\"):
+        raise click.UsageError("--ipc must be a local Windows named pipe path.")
+    if ipc and os.name != "nt" and not os.path.isabs(ipc):
+        raise click.UsageError("--ipc must be an absolute Unix socket path.")
 
     # Load config files before resolving other settings.
-    cfg = config.init(config_path)
+    cfg = config.init(config_path, isolated=isolated)
+    if desktop_mode is not None:
+        os.environ["OPEN_TERMINAL_DESKTOP_MODE"] = desktop_mode
+    if desktop_environment is not None:
+        os.environ["OPEN_TERMINAL_DESKTOP_ENVIRONMENT"] = desktop_environment
 
     # Resolve host/port: CLI flag > config file > built-in default
-    host = host or cfg.get("host", "127.0.0.1" if cftunnel else "0.0.0.0")
+    ipc_port = port  # Only an explicit --port opts IPC mode into TCP listening.
+    host = host or ("127.0.0.1" if ipc else cfg.get("host", "127.0.0.1" if cftunnel else "0.0.0.0"))
     port = port if port is not None else cfg.get("port", 8000)
     if cftunnel and (type(port) is not int or not 1 <= port <= 65535):
         raise click.UsageError("--cftunnel requires a port between 1 and 65535.")
@@ -121,14 +149,16 @@ def run(
         binary = resolve_binary(yes=yes)
 
     click.echo(BANNER)
+    click.echo(f"  Open Terminal v{version('open-terminal')}")
+    click.echo()
 
     # -- Startup info block --
     local_url = f"http://{'localhost' if host in ('0.0.0.0', '127.0.0.1') else host}:{port}"
     if cftunnel:
         local_url = origin_url(host, port)
 
-    click.echo(f"  {click.style('Local:', bold=True)}    {click.style(local_url, fg='cyan')}")
-    if host == "0.0.0.0":
+    click.echo(f"  {click.style('Local:', bold=True)}    {click.style('IPC: ' + ipc if ipc else local_url, fg='cyan')}")
+    if not ipc and host == "0.0.0.0":
         import socket
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -144,7 +174,7 @@ def run(
         click.echo(f"  {click.style('API Key:', bold=True)}  {api_key}")
         click.echo()
 
-    if host in ("0.0.0.0", "::"):
+    if not ipc and host in ("0.0.0.0", "::"):
         click.echo(click.style("  Warning: Listening on all network interfaces.", fg="yellow"))
         click.echo(click.style("  Use --host 127.0.0.1 to restrict to this machine.", dim=True))
         click.echo()
@@ -159,18 +189,81 @@ def run(
         click.echo(click.style("  └─────────────────────────────────────────────────────────────┘", fg="yellow"))
         click.echo()
 
-    from open_terminal.env import UVICORN_LOOP, UVICORN_TIMEOUT_KEEP_ALIVE
+    from open_terminal.env import MULTI_USER, SETUP_SCRIPT, START_DIR, UVICORN_LOOP, UVICORN_TIMEOUT_KEEP_ALIVE
+
+    # Multi-user servers have a home per user, so there is no single place to set up.
+    if not MULTI_USER and (START_DIR or SETUP_SCRIPT.strip()):
+        from open_terminal.utils.setup import run_setup
+
+        setup = run_setup(os.getcwd())
+        if setup:
+            click.echo(
+                click.style("  Setup script finished.", dim=True)
+                if setup["status"] == "ok"
+                else click.style(
+                    f"  Setup script failed (exit {setup['exit_code']}). See ~/.open-terminal/setup.log",
+                    fg="yellow",
+                )
+            )
+            click.echo()
 
     uvicorn_options = {}
     if UVICORN_TIMEOUT_KEEP_ALIVE is not None:
         uvicorn_options["timeout_keep_alive"] = UVICORN_TIMEOUT_KEEP_ALIVE
+    if ipc:
+        from open_terminal.ipc import run_server as run_ipc_server
+        run_ipc_server(ipc, ipc_port, host, **uvicorn_options)
+        return
     if cftunnel:
         run_server(binary, host, port, loop=UVICORN_LOOP, **uvicorn_options)
         return
+    import uvicorn
+
     uvicorn.run(
         "open_terminal.main:app", host=host, port=port, loop=UVICORN_LOOP,
         **uvicorn_options,
     )
+
+
+@main.command()
+@click.argument("path")
+def bridge(path: str):
+    """Relay stdin/stdout to a local --ipc socket.
+
+    For clients that reach this machine over SSH when the server blocks Unix
+    socket forwarding: run `open-terminal bridge <socket>` over SSH and speak
+    HTTP over its stdin/stdout.
+    """
+    if os.name == "nt":
+        raise click.UsageError("bridge supports Unix sockets only.")
+    if not os.path.isabs(path):
+        raise click.UsageError("PATH must be an absolute Unix socket path.")
+
+    from open_terminal.bridge import relay
+
+    raise SystemExit(relay(path))
+
+
+@main.command("install-deps")
+@click.argument("features", nargs=-1, type=click.Choice(["desktop", "browser"]))
+@click.option("--package", "extra", multiple=True, help="Also install this apt package. Repeat for more.")
+@click.option("--dry-run", is_flag=True, help="Print what would be installed without installing it.")
+@click.option("--yes", is_flag=True, help="Install without asking.")
+def install_deps(features: tuple[str, ...], extra: tuple[str, ...], dry_run: bool, yes: bool):
+    """Install the system packages for Desktop and Chrome tabs.
+
+    Installs both unless FEATURES names one, or only --package is given.
+    Supports Debian and Ubuntu and needs root or sudo. Restart Open Terminal
+    afterwards.
+    """
+    from open_terminal import config
+
+    config.init()
+
+    from open_terminal.utils import packages
+
+    features = features or (() if extra else packages.FEATURES)
+    raise SystemExit(packages.install(features, extra, dry_run=dry_run, yes=yes))
 
 
 @main.command()

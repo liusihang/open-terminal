@@ -225,12 +225,14 @@ def test_write_file_does_not_overwrite_by_default(tmp_path: Path):
     )
 
     assert first.status_code == 200
+    assert first.json()["created"] is True
     assert second.status_code == 409
     conflict_detail = second.json()["detail"]
     assert "overwrite=false" in conflict_detail
     assert "overwrite=true" in conflict_detail
     assert "apply_patch" in conflict_detail
     assert overwrite.status_code == 200
+    assert overwrite.json()["created"] is False
     assert target.read_text() == "second"
 
 
